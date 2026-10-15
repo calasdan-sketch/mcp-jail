@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mcp-jail"
+version = "0.1.0"
+description = "Runtime permission firewall for MCP servers (stdio proxy)"
+requires-python = ">=3.10"
+
+[project.scripts]
+mcp-jail = "mcp_jail.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mcp_jail*"]
