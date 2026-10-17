@@ -72,7 +72,7 @@ Policy (`policy.json`):
   Names are compared **normalised** — Unicode NFKC, case-folded,
   trimmed, invisible characters (zero-width space, soft hyphen, BOM,
   control and combining marks) removed — so `Delete_All`,
-  `delete_all ` and `delete_all​` are all `delete_all`. The same
+  `delete_all ` and `delete_all` plus a U+200B are all `delete_all`. The same
   normalised name selects a tool's `arg_rules`.
 - `arg_rules`: per-tool regexes keyed by **argument path**, matched
   against every value in the arguments however deeply it is nested
