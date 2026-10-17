@@ -21,6 +21,28 @@ from . import VERSION
 from . import jail as jail_mod
 
 
+# Tests patch this to exercise the Windows branch on any OS.
+_WINDOWS = os.name == "nt"
+
+
+def _pipe_gone(exc: BaseException) -> bool:
+    """Did the reader of our stdout go away?
+
+    POSIX raises BrokenPipeError (EPIPE). Windows reports the same thing as
+    a plain OSError with errno EINVAL and no file name (measured on Windows
+    11 / Python 3.11: errno 22, winerror None), raised by the FLUSH rather
+    than by the print, and it fails a second time at interpreter exit
+    (status 120) unless fd 1 is pointed at the null device first."""
+    if isinstance(exc, BrokenPipeError):
+        return True
+    if not isinstance(exc, OSError):
+        return False
+    if exc.errno == errno.EPIPE:
+        return True
+    return (_WINDOWS and exc.errno == errno.EINVAL
+            and getattr(exc, "filename", None) is None)
+
+
 def _broken_pipe() -> int:
     """stdout's reader went away (`mcp-jail --audit | head`): leave
     quietly. stdout is pointed at the null device first so the
@@ -175,12 +197,12 @@ def main(argv=None) -> int:
     _harden_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
     try:
-        return _main(argv)
-    except BrokenPipeError:
-        return _broken_pipe()
+        rc = _main(argv)
+        if sys.stdout is not None:
+            sys.stdout.flush()  # a closed pipe surfaces here, not at interpreter exit
+        return rc
     except OSError as e:
-        # Windows reports a closed pipe as EINVAL, not EPIPE
-        if os.name == "nt" and e.errno == errno.EINVAL:
+        if _pipe_gone(e):
             return _broken_pipe()
         raise
 
