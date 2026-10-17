@@ -21,6 +21,7 @@ runs the same way on Windows as on POSIX (no select() on pipes).
 from __future__ import annotations
 
 import collections
+import fnmatch
 import io
 import json
 import os
@@ -33,6 +34,14 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
+
+from . import VERSION
+
+# The MCP revision learn offers in its initialize handshake. The server
+# answers with the revision it will speak; stdio has nowhere else to put
+# it, so learn only reports it.
+PROTOCOL_VERSION = "2025-06-18"
 
 # ---------------------------------------------------------------------------
 # paths
@@ -69,7 +78,15 @@ def audit_log_path() -> str:
 # policy
 # ---------------------------------------------------------------------------
 
-Rule = tuple[tuple[str, ...], "re.Pattern[str]"]
+# One compiled argument rule: where it applies (path segments), the
+# regex, the JSON type it is restricted to (None = any scalar, matched
+# by text) and whether it explicitly spells out `\.\.` (opt-in to `..`).
+Rule = collections.namedtuple("Rule", "path pattern vtype dotdot_ok")
+
+# JSON type names a typed rule ({"type": ..., "pattern": ...}) may carry.
+# object/array only ever describe EMPTY containers: a non-empty one is
+# structure, and its values are matched one by one.
+VALUE_TYPES = ("string", "number", "boolean", "null", "object", "array")
 
 # Arguments nested deeper than this are denied outright. Real tool calls
 # are a handful of levels deep; thousands of levels is an attack on the
@@ -82,6 +99,74 @@ AUDIT_VALUE_MAX = 200  # chars of any one string value kept in the audit log
 # A value containing a `..` path segment (`/../`, leading `../`,
 # trailing `/..`, or just `..`), with either separator.
 _TRAVERSAL = re.compile(r"(?:^|[/\\])\.\.(?:[/\\]|$)")
+
+# Prepended by `learn` to every class-based pattern: a prefix like
+# /srv/data/ plus a class that admits `.` and `/` would otherwise match
+# /srv/data/../../etc/passwd -- or, with a Windows prefix,
+# C:\proj\../.ssh/id_rsa, hence both separators. The matcher refuses `..`
+# segments too; the guard keeps the policy file honest on its own.
+_TRAVERSAL_GUARD = r"(?!.*(?:^|[/\\])\.\.(?:[/\\]|$))"
+# What mcp-jail < 0.5 emitted (forward slash only). Still recognised as a
+# guard, so a policy learned back then does not count as opting in to `..`.
+_OLD_TRAVERSAL_GUARD = r"(?!.*(?:^|/)\.\.(?:/|$))"
+
+# Tool names are compared after NFKC normalisation and case folding, with
+# invisible characters removed: format (zero-width space, soft hyphen,
+# BOM), control, surrogate and combining marks. `Delete_All`,
+# `delete_all ` and `delete_all\u200b` are all `delete_all`.
+_IGNORED_NAME_CATEGORIES = frozenset({"Cf", "Cc", "Cs", "Mn", "Me"})
+
+
+def normalize_tool_name(name: str) -> str:
+    text = unicodedata.normalize("NFKC", name).casefold()
+    text = "".join(ch for ch in text
+                   if unicodedata.category(ch) not in _IGNORED_NAME_CATEGORIES)
+    return text.strip()
+
+
+def _strict_end_anchors(pattern: str) -> str:
+    """Rewrite every `$` of an allow pattern (outside character classes,
+    not escaped) to `\\Z`. In `re`, `$` also matches just before a
+    trailing newline, so `^ls$` would admit "ls\\n"; an allow pattern
+    must pin the whole value."""
+    out: list[str] = []
+    i, n, in_class = 0, len(pattern), False
+    while i < n:
+        c = pattern[i]
+        if c == "\\":
+            out.append(pattern[i:i + 2])
+            i += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+        elif c == "[":
+            in_class = True
+            out.append(c)
+            i += 1
+            # `]` right after `[` or `[^` is a literal, not the class end
+            if i < n and pattern[i] == "^":
+                out.append("^")
+                i += 1
+            if i < n and pattern[i] == "]":
+                out.append("]")
+                i += 1
+            continue
+        elif c == "$":
+            out.append(r"\Z")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def _opts_into_dotdot(pattern: str) -> bool:
+    """A pattern spells out `\\.\\.` itself (outside the traversal guard):
+    the author means it, so the matcher's `..` veto is skipped."""
+    for guard in (_TRAVERSAL_GUARD, _OLD_TRAVERSAL_GUARD):
+        pattern = pattern.replace(guard, "")
+    return r"\.\." in pattern
 
 
 def _parse_path(path: str) -> tuple[str, ...]:
@@ -116,8 +201,43 @@ def _path_matches(rule: tuple[str, ...], path: tuple[str, ...],
     return False
 
 
-def _compile_rule_set(spec, where: str = "arg_rules") -> list[Rule]:
-    """Normalise one allow/deny spec into [(path_segments, pattern)].
+def _is_typed_rule(pat) -> bool:
+    return isinstance(pat, dict) and ("type" in pat or "pattern" in pat)
+
+
+def _compile_rule(segs, pat, where: str, allow: bool) -> Rule:
+    """One pattern spec -> Rule. A spec is a regex string, a compiled
+    pattern, or a typed rule {"type": T, "pattern": P} (either key may
+    be omitted: a type alone admits any value of that type, a pattern
+    alone is matched by text whatever the type)."""
+    vtype = None
+    if isinstance(pat, dict):
+        extra = set(pat) - {"type", "pattern"}
+        if extra or not pat:
+            raise ValueError(f"{where}: a typed rule has only 'type' and "
+                             f"'pattern', got {sorted(pat)}")
+        vtype = pat.get("type")
+        if vtype is not None and vtype not in VALUE_TYPES:
+            raise ValueError(f"{where}: type must be one of {VALUE_TYPES}, "
+                             f"got {vtype!r}")
+        pat = pat.get("pattern", "")
+    if isinstance(pat, re.Pattern):
+        flags, pat = pat.flags, pat.pattern
+    elif isinstance(pat, str):
+        flags = 0
+    else:
+        raise ValueError(f"{where}: a pattern is a regex string or a "
+                         f"{{\"type\": ..., \"pattern\": ...}} rule, "
+                         f"got {pat!r}")
+    dotdot_ok = _opts_into_dotdot(pat)
+    if allow:
+        pat = _strict_end_anchors(pat)
+    return Rule(segs, re.compile(pat, flags), vtype, dotdot_ok)
+
+
+def _compile_rule_set(spec, where: str = "arg_rules",
+                      allow: bool = False) -> list[Rule]:
+    """Normalise one allow/deny spec into a list of Rule.
 
     Accepts the documented object form {"path": ["regex", ...]} and the
     shorthand list form ["regex", ...] (== {"**": [...]}: every value at
@@ -127,7 +247,7 @@ def _compile_rule_set(spec, where: str = "arg_rules") -> list[Rule]:
         return []
     if isinstance(spec, (list, tuple)):
         spec = {"**": list(spec)}
-    if isinstance(spec, (str, re.Pattern)):
+    if isinstance(spec, (str, re.Pattern)) or _is_typed_rule(spec):
         spec = {"**": [spec]}
     if not isinstance(spec, dict):
         raise ValueError(f"{where}: expected a list of patterns or an "
@@ -135,14 +255,37 @@ def _compile_rule_set(spec, where: str = "arg_rules") -> list[Rule]:
     rules: list[Rule] = []
     for path, pats in spec.items():
         segs = _parse_path(path)
-        if isinstance(pats, (str, re.Pattern)):
+        if isinstance(pats, (str, re.Pattern)) or _is_typed_rule(pats):
             pats = [pats]
         if not isinstance(pats, (list, tuple)):
             raise ValueError(f"{where}.{path}: expected a list of patterns")
         for pat in pats:
-            rules.append((segs, pat if isinstance(pat, re.Pattern)
-                          else re.compile(pat)))
+            rules.append(_compile_rule(segs, pat, f"{where}.{path}", allow))
     return rules
+
+
+def _method_list(pol: dict, key: str) -> list[str]:
+    val = pol.get(key)
+    if val is None:
+        return []
+    if not isinstance(val, (list, tuple)) or not all(
+            isinstance(m, str) and m for m in val):
+        raise ValueError(f"{key} must be a list of JSON-RPC method names")
+    return list(val)
+
+
+def method_denied(pol: dict, method: str) -> bool:
+    """deny_methods: exact names or fnmatch globs (`resources/*`)."""
+    return any(fnmatch.fnmatchcase(method, pat)
+               for pat in (pol.get("deny_methods") or []))
+
+
+def method_policed(pol: dict, method: str) -> bool:
+    """tools/call is always policed; policed_methods adds more (their
+    params.name -- or params.uri -- is the tool name, params.arguments
+    the arguments)."""
+    return method == "tools/call" or method in (
+        pol.get("policed_methods") or [])
 
 
 def compile_policy(pol: dict) -> dict:
@@ -156,6 +299,7 @@ def compile_policy(pol: dict) -> dict:
     rules_by_tool = pol.get("arg_rules") or {}
     if not isinstance(rules_by_tool, dict):
         raise ValueError("arg_rules must be an object keyed by tool name")
+    by_norm: dict[str, dict] = {}
     for tool, rules in rules_by_tool.items():
         if not isinstance(rules, dict):
             raise ValueError(f"arg_rules.{tool} must be an object with "
@@ -165,13 +309,22 @@ def compile_policy(pol: dict) -> dict:
             pass  # explicit: any arguments (deny rules still apply)
         else:
             rules["allow"] = _compile_rule_set(allow,
-                                               f"arg_rules.{tool}.allow")
+                                               f"arg_rules.{tool}.allow",
+                                               allow=True)
         rules["deny"] = _compile_rule_set(rules.get("deny"),
                                           f"arg_rules.{tool}.deny")
+        norm = normalize_tool_name(tool)
+        if norm in by_norm:
+            raise ValueError(f"arg_rules: {tool!r} is the same tool name as "
+                             f"another entry once normalised")
+        by_norm[norm] = rules
+    pol["_rules_by_norm"] = by_norm
     for key in ("allow_tools", "deny_tools"):
         val = pol.get(key)
         if val is not None and not isinstance(val, (list, tuple, set, dict)):
             raise ValueError(f"{key} must be a list of tool names")
+    for key in ("policed_methods", "deny_methods"):
+        _method_list(pol, key)
     mode = pol.get("audit_args", "denied")
     if mode not in AUDIT_ARGS_MODES:
         raise ValueError(f"audit_args must be one of {AUDIT_ARGS_MODES}, "
@@ -191,19 +344,27 @@ def load_policy(path: str) -> dict:
 def default_policy() -> dict:
     return {
         "_comment": "mcp-jail policy. allow_tools/deny_tools are tool names "
-                    "('*' = all; deny wins). arg_rules.<tool>.allow/deny map "
-                    "argument paths ('path', 'args.*.path', '**') to regexes "
-                    "checked against every value at that path, however "
-                    "deeply nested; deny paths match key names "
-                    "case-insensitively. strict_args: a tool without allow "
-                    "patterns accepts only empty arguments (set its allow "
-                    "to \"*\" to accept any). audit_args: log argument "
-                    "values for 'denied' (default), 'all' or 'none' calls. "
-                    "hide_denied strips tools denied by name from "
-                    "tools/list so agents don't see them.",
+                    "('*' = all; deny wins; names are compared normalised: "
+                    "NFKC, case-folded, trimmed, invisible characters "
+                    "removed). arg_rules.<tool>.allow/deny map argument "
+                    "paths ('path', 'args.*.path', '**') to regexes checked "
+                    "against every value at that path, however deeply "
+                    "nested; a rule may be {\"type\": \"number\", "
+                    "\"pattern\": ...} to pin the JSON type; deny paths "
+                    "match key names case-insensitively. strict_args: a "
+                    "tool without allow patterns accepts only empty "
+                    "arguments, {} (set its allow to \"*\" to accept any). "
+                    "audit_args: log argument values for 'denied' "
+                    "(default), 'all' or 'none' calls. hide_denied strips "
+                    "tools denied by name from tools/list so agents don't "
+                    "see them. Only tools/call (plus policed_methods, e.g. "
+                    "prompts/get, resources/read) is checked; deny_methods "
+                    "refuses whole JSON-RPC methods ('resources/*').",
         "allow_tools": ["*"],
         "deny_tools": [],
         "arg_rules": {},
+        "policed_methods": ["tools/call"],
+        "deny_methods": [],
         "strict_args": False,
         "audit_args": "denied",
         "hide_denied": True,
@@ -213,7 +374,22 @@ def default_policy() -> dict:
 def _leaf_text(v) -> str:
     if isinstance(v, str):
         return v
-    return json.dumps(v)  # true/false/null/numbers as JSON text
+    return json.dumps(v)  # true/false/null/numbers/{}/[] as JSON text
+
+
+def _type_tag(v) -> str:
+    """JSON type name of a value (what a typed rule's "type" names)."""
+    if v is None:
+        return "null"
+    if isinstance(v, bool):
+        return "boolean"
+    if isinstance(v, (int, float)):
+        return "number"
+    if isinstance(v, dict):
+        return "object"
+    if isinstance(v, list):
+        return "array"
+    return "string"
 
 
 def _nodes(value, max_depth: int = MAX_ARG_DEPTH):
@@ -236,53 +412,72 @@ def _nodes(value, max_depth: int = MAX_ARG_DEPTH):
 
 
 def _walk(value):
-    """Yield (path, text, is_leaf) for every scalar under `value`, plus one
-    joined-text entry per array of scalars (so ["rm", "-rf", "/"] is also
-    seen as "rm -rf /")."""
+    """Yield (path, text, is_leaf, vtype) for every value under `value`:
+    scalars, and empty objects/arrays (a value too -- text `{}` / `[]`,
+    type object/array; the root is never one). Plus one joined-text
+    entry (is_leaf False, vtype None) per array of scalars, so
+    ["rm", "-rf", "/"] is also seen as "rm -rf /"."""
     for path, node in _nodes(value):
         if isinstance(node, dict):
+            if not node and path:
+                yield (path, "{}", True, "object")
             continue
         if isinstance(node, list):
-            if node and all(not isinstance(v, (dict, list)) for v in node):
-                yield (path, " ".join(_leaf_text(v) for v in node), False)
+            if not node:
+                if path:
+                    yield (path, "[]", True, "array")
+            elif all(not isinstance(v, (dict, list)) for v in node):
+                yield (path, " ".join(_leaf_text(v) for v in node), False, None)
             continue
-        yield (path, _leaf_text(node), True)
+        yield (path, _leaf_text(node), True, _type_tag(node))
 
 
 def _fmt_path(path: tuple[str, ...]) -> str:
     return ".".join(path) if path else "(arguments)"
 
 
+def _name_listed(name_norm: str, names) -> bool:
+    return any(isinstance(t, str) and normalize_tool_name(t) == name_norm
+               for t in names)
+
+
 def tool_visible(pol: dict, name) -> tuple[bool, str]:
     """Name-level decision: deny_tools / allow_tools only. This is what
     hide_denied uses for tools/list — argument rules are per-call and
-    must not hide a tool that is callable with the right arguments."""
+    must not hide a tool that is callable with the right arguments.
+    Names are compared normalised (see normalize_tool_name)."""
     if not isinstance(name, str) or not name:
+        return False, "tool name must be a non-empty string"
+    norm = normalize_tool_name(name)
+    if not norm:
         return False, "tool name must be a non-empty string"
     deny = pol.get("deny_tools") or []
     allow = pol.get("allow_tools")
     if allow is None:
         allow = ["*"]
-    if name in deny:
+    if _name_listed(norm, deny):
         return False, f"tool '{name}' is denied by policy"
-    if "*" not in allow and name not in allow:
+    if "*" not in allow and not _name_listed(norm, allow):
         return False, f"tool '{name}' is not in allow_tools"
     return True, ""
 
 
-def _allow_admits(allow: list[Rule], path, text) -> tuple[bool, bool]:
-    """Does some allow rule admit this leaf? A value holding a `..` path
-    segment is never admitted unless the pattern itself spells out
-    `\\.\\.` (explicit opt-in): an allowlist on paths must not be a door
-    to `/srv/data/../../etc/passwd`. Returns (admitted, traversal_veto)."""
+def _allow_admits(allow: list[Rule], path, text, vtype) -> tuple[bool, bool]:
+    """Does some allow rule admit this leaf? A typed rule admits only its
+    type. A value holding a `..` path segment is never admitted unless
+    the pattern itself spells out `\\.\\.` (explicit opt-in): an
+    allowlist on paths must not be a door to `/srv/data/../../etc/passwd`.
+    Returns (admitted, traversal_veto)."""
     path_hit = False
-    for rpath, pat in allow:
-        if not _path_matches(rpath, path):
+    for rule in allow:
+        if not _path_matches(rule.path, path):
             continue
         path_hit = True
-        if not pat.search(text):
+        if rule.vtype is not None and rule.vtype != vtype:
             continue
-        if _TRAVERSAL.search(text) and r"\.\." not in pat.pattern:
+        if not rule.pattern.search(text):
+            continue
+        if _TRAVERSAL.search(text) and not rule.dotdot_ok:
             continue  # vetoed
         return True, False
     return False, bool(path_hit and _TRAVERSAL.search(text))
@@ -292,7 +487,9 @@ def tool_allowed(pol: dict, name, args) -> tuple[bool, str]:
     """Full per-call decision: tool name, then argument rules. Any
     failure inside the evaluation denies (fail closed).
 
-    Argument rules are matched over objects and arrays:
+    Argument rules are matched over objects and arrays. A *value* is a
+    scalar or an empty object/array (text `{}` / `[]`); a non-empty
+    container is structure, and its values are matched one by one.
 
     - deny: a rule for path P is checked (re.search) against every value
       at P *and below it* — wrapping a value in an object or array never
@@ -301,11 +498,12 @@ def tool_allowed(pol: dict, name, args) -> tuple[bool, str]:
     - allow: when a tool has allow rules, EVERY value in the arguments
       must match an allow rule whose path matches the value's path
       exactly ('*' = one segment, '**' = any segments). Unknown paths are
-      denied — default-deny, which is what `learn` generates. A value
-      containing a `..` path segment is never admitted unless the
-      pattern mentions `\\.\\.`. `"allow": "*"` admits any arguments.
+      denied — default-deny, which is what `learn` generates. A typed
+      rule admits only values of its JSON type. A value containing a
+      `..` path segment is never admitted unless the pattern mentions
+      `\\.\\.`. `"allow": "*"` admits any arguments.
     - strict_args (policy-level): a tool with no allow rules accepts
-      only empty arguments, instead of anything.
+      only empty arguments ({}), instead of anything.
     """
     try:
         return _tool_allowed(pol, name, args)
@@ -319,8 +517,7 @@ def _tool_allowed(pol: dict, name, args) -> tuple[bool, str]:
         return False, reason
     if not pol.get("_compiled"):
         compile_policy(pol)  # once, in place
-    rules_by_tool = pol.get("arg_rules") or {}
-    rules = rules_by_tool.get(name) or {}
+    rules = pol["_rules_by_norm"].get(normalize_tool_name(name)) or {}
     deny = rules.get("deny") or []
     allow = rules.get("allow")
     if args is None:
@@ -329,19 +526,21 @@ def _tool_allowed(pol: dict, name, args) -> tuple[bool, str]:
         return False, (f"tool '{name}': arguments must be a JSON object, "
                        f"got {type(args).__name__}")
     entries = list(_walk(args))
-    for path, text, _leaf in entries:
-        for rpath, pat in deny:
-            if (_path_matches(rpath + ("**",), path, fold=True)
-                    and pat.search(text)):
+    for path, text, _leaf, vtype in entries:
+        for rule in deny:
+            if (_path_matches(rule.path + ("**",), path, fold=True)
+                    and (rule.vtype is None or rule.vtype == vtype)
+                    and rule.pattern.search(text)):
                 return False, (f"tool '{name}': argument {_fmt_path(path)} "
-                               f"matches deny pattern '{pat.pattern}'")
+                               f"matches deny pattern "
+                               f"'{rule.pattern.pattern}'")
     if allow == "*":
         return True, ""
     if allow:
-        for path, text, leaf in entries:
+        for path, text, leaf, vtype in entries:
             if not leaf:
                 continue
-            admitted, vetoed = _allow_admits(allow, path, text)
+            admitted, vetoed = _allow_admits(allow, path, text, vtype)
             if admitted:
                 continue
             if vetoed:
@@ -350,7 +549,7 @@ def _tool_allowed(pol: dict, name, args) -> tuple[bool, str]:
             return False, (f"tool '{name}': argument {_fmt_path(path)} "
                            f"matches no allow pattern")
     elif pol.get("strict_args"):
-        for path, text, leaf in entries:
+        for path, text, leaf, _vtype in entries:
             if leaf:
                 return False, (f"tool '{name}': argument {_fmt_path(path)} "
                                f"is not allowed (strict_args: this tool has "
@@ -435,8 +634,28 @@ def audit(event: dict) -> None:
 # transport: newline-delimited JSON over binary pipes, reader threads
 # ---------------------------------------------------------------------------
 
-PARSE_ERROR, INVALID_REQUEST = -32700, -32600
+PARSE_ERROR, INVALID_REQUEST, METHOD_NOT_FOUND = -32700, -32600, -32601
 INVALID_PARAMS, INTERNAL_ERROR = -32602, -32603
+
+_NO_ID = object()
+
+
+def _lenient_id(line: bytes):
+    """The id of a server document that _parse refused only for its
+    duplicate keys, so the request it answers can be failed closed by
+    id rather than by guesswork. _NO_ID when there is none."""
+    try:
+        obj = json.loads(line.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return _NO_ID
+    if isinstance(obj, dict) and "id" in obj:
+        return obj["id"]
+    return _NO_ID
+
+
+def _preview(line: bytes, limit: int = 200) -> str:
+    text = line.decode("utf-8", "replace").strip()
+    return repr(text[:limit] + ("..." if len(text) > limit else ""))
 
 
 def _rpc_error(req_id, code: int, message: str) -> dict:
@@ -650,14 +869,12 @@ class _Pending:
 
     def __init__(self):
         self._by_key: dict[str, collections.deque] = {}
-        self._seq = 0
 
     def add(self, req_id, method: str, deadline: float | None,
             call=None) -> None:
-        self._seq += 1
         self._by_key.setdefault(_id_key(req_id), collections.deque()).append(
             {"id": req_id, "method": method, "deadline": deadline,
-             "seq": self._seq, "call": call})
+             "call": call})
 
     def pop(self, req_id) -> dict | None:
         key = _id_key(req_id)
@@ -690,21 +907,6 @@ class _Pending:
         out = [e for dq in self._by_key.values() for e in dq]
         self._by_key.clear()
         return out
-
-    def oldest(self) -> dict | None:
-        """Remove and return the longest-waiting entry (used to attribute
-        a non-JSON server line to the request it most likely answers)."""
-        best_key, best = None, None
-        for key, dq in self._by_key.items():
-            if best is None or dq[0]["seq"] < best["seq"]:
-                best_key, best = key, dq[0]
-        if best is None:
-            return None
-        dq = self._by_key[best_key]
-        dq.popleft()
-        if not dq:
-            del self._by_key[best_key]
-        return best
 
     def next_deadline(self) -> float | None:
         ds = [e["deadline"] for dq in self._by_key.values() for e in dq
@@ -753,9 +955,12 @@ class _Proxy:
             raw = raw + b"\n"
         self.server.write(raw if raw is not None else _encode(msg))
 
-    def _audit(self, name, args, ok: bool, reason: str) -> None:
+    def _audit(self, name, args, ok: bool, reason: str,
+               method: str = "tools/call") -> None:
         event = {"tool": name if isinstance(name, str) else repr(name),
                  "decision": "allow" if ok else "deny", "reason": reason}
+        if method != "tools/call":
+            event["method"] = method
         mode = self.pol.get("audit_args", "denied")
         if mode == "all" or (mode == "denied" and not ok):
             event["args"] = audit_args_view(args)
@@ -809,10 +1014,20 @@ class _Proxy:
                                             "be a string"))
             return
         call = None
-        if method == "tools/call":
+        if self.pol is not None and method_denied(self.pol, method):
+            reason = f"method '{method}' is denied by policy"
+            audit({"method": method, "decision": "deny", "reason": reason})
+            if has_id:
+                self.client.send(_rpc_error(req_id, METHOD_NOT_FOUND,
+                                            f"mcp-jail denied: {reason}"))
+            return
+        if (method == "tools/call" if self.pol is None
+                else method_policed(self.pol, method)):
             params = msg.get("params")
             params = params if isinstance(params, dict) else {}
             name = params.get("name")
+            if name is None and method != "tools/call":
+                name = params.get("uri")  # resources/read, resources/subscribe
             targs = params.get("arguments")
             if targs is None:
                 targs = {}
@@ -820,7 +1035,7 @@ class _Proxy:
                 ok, reason = True, ""
             else:
                 ok, reason = tool_allowed(self.pol, name, targs)
-                self._audit(name, targs, ok, reason)
+                self._audit(name, targs, ok, reason, method)
             if not ok:
                 # Same id, same type, as the request. A notification
                 # (no id) never gets a response — it is just dropped.
@@ -828,7 +1043,7 @@ class _Proxy:
                     self.client.send(_rpc_error(req_id, INVALID_PARAMS,
                                                 f"mcp-jail denied: {reason}"))
                 return
-            if self.observer is not None and has_id:
+            if self.observer is not None and has_id and method == "tools/call":
                 call = (name, targs)  # recorded once the server succeeds
             # The server gets the object the policy checked, re-encoded:
             # never the client's bytes, whose parse it might disagree on.
@@ -849,17 +1064,21 @@ class _Proxy:
     def _on_server_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
         if code is not None:
-            # A server that prints to stdout (or emits a document with
-            # duplicate keys) is corrupting the protocol stream. Fail the
-            # longest-waiting request closed (the one this most likely
-            # answers) and keep the proxy alive; with nothing in flight
-            # just log it.
-            entry = self.pending.oldest()
+            # Not a JSON-RPC frame. npm servers console.log() banners and
+            # progress onto stdout; such a line answers nothing, so it is
+            # logged and skipped -- never charged to a pending request,
+            # whose real answer would then be dropped. A request the
+            # server never answers is still caught by --timeout. A JSON
+            # document refused for duplicate keys IS a response: the
+            # request it names (by id) fails closed.
+            rid = _lenient_id(line) if code == INVALID_REQUEST else _NO_ID
+            entry = self.pending.pop(rid) if rid is not _NO_ID else None
             if entry is not None:
                 self.client.send(_rpc_error(entry["id"], INTERNAL_ERROR,
-                                            "bad response from server"))
+                                            f"bad response from server: {err}"))
             else:
-                self._log(f"ignoring bad line from server: {err}")
+                self._log(f"ignoring non-JSON line from server: "
+                          f"{_preview(line)}")
             return
         if msg is None:
             return
@@ -1007,27 +1226,17 @@ _CHAR_CLASSES = [
     ("[a-zA-Z0-9_/.-]", set(string.ascii_letters + string.digits + "_/.-")),
 ]
 
-# Prepended to every class-based pattern: a prefix like /srv/data/ plus
-# a class that admits `.` and `/` would otherwise match
-# /srv/data/../../etc/passwd. The matcher refuses `..` segments too; the
-# guard keeps the policy file honest on its own.
-_TRAVERSAL_GUARD = r"(?!.*(?:^|/)\.\.(?:/|$))"
-
 _MIN_USEFUL_PREFIX = 2  # shorter shared prefixes fall back to alternation
 
-
-def _type_tag(v) -> str:
-    if v is None:
-        return "null"
-    if isinstance(v, bool):
-        return "bool"
-    if isinstance(v, (int, float)):
-        return "num"
-    return "str"
+# JSON number text, exponent notation included (1e-05 is how json.dumps
+# spells 0.00001)
+_NUMBER_PATTERN = r"\A-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?\Z"
 
 
 def _string_core(bodies: list[str]) -> str:
     """Tightest value-pattern for observed string values."""
+    if len(set(bodies)) == 1:
+        return re.escape(bodies[0])  # single distinct value: exact
     lcp = os.path.commonprefix(bodies)
     suffix_chars = set("".join(b[len(lcp):] for b in bodies))
     chosen = None
@@ -1045,34 +1254,45 @@ def _string_core(bodies: list[str]) -> str:
 
 
 def _value_pattern(values: list) -> str:
-    """One anchored allow-pattern for the scalar values seen at a path.
+    """One anchored pattern for same-typed values seen at a path.
 
-    tool_allowed() matches a value's text with re.search, so patterns are
-    anchored ^...$ to pin the whole value.
+    Anchored \\A...\\Z (not ^...$: `$` would also admit a value with a
+    trailing newline), so the regex pins the whole value for any
+    consumer of the policy file, not only mcp-jail's matcher.
     """
-    tags = {_type_tag(v) for v in values}
-    if len(tags) > 1:
-        lits = sorted({_leaf_text(v) for v in values})
-        return "^(?:" + "|".join(re.escape(l) for l in lits) + ")$"
-    tag = tags.pop()
+    tag = _type_tag(values[0])
     if tag == "null":
-        return "^null$"
-    if tag == "bool":
-        return "^(?:true|false)$"
-    if tag == "num":
-        # JSON number text, exponent notation included (1e-05 is how
-        # json.dumps spells 0.00001)
-        return r"^-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?$"
-    return "^" + _string_core([str(v) for v in values]) + "$"
+        return r"\Anull\Z"
+    if tag == "boolean":
+        return r"\A(?:true|false)\Z"
+    if tag == "number":
+        return _NUMBER_PATTERN
+    if tag == "object":
+        return r"\A\{\}\Z"  # only an empty object is ever a value
+    if tag == "array":
+        return r"\A\[\]\Z"
+    return r"\A" + _string_core([str(v) for v in values]) + r"\Z"
+
+
+def _value_rules(values: list) -> list[dict]:
+    """Typed allow rules for the values seen at one path: one
+    {"type": T, "pattern": P} per JSON type seen, so a learned number
+    admits 3 but never the string "3"."""
+    by_type: dict[str, list] = {}
+    for v in values:
+        by_type.setdefault(_type_tag(v), []).append(v)
+    return [{"type": tag, "pattern": _value_pattern(by_type[tag])}
+            for tag in sorted(by_type)]
 
 
 def _observed_paths(args) -> list[tuple[str, object]]:
-    """Flatten call arguments to (path, scalar) with numeric segments
-    (array indices) generalised to '*', so tags.0/tags.1 become tags.*."""
+    """Flatten call arguments to (path, value) -- scalars and empty
+    containers -- with numeric segments (array indices) generalised to
+    '*', so tags.0/tags.1 become tags.*."""
     out = []
     for path, value in _nodes(args):
-        if isinstance(value, (dict, list)):
-            continue
+        if isinstance(value, (dict, list)) and (value or not path):
+            continue  # structure (or the root object): not a value
         segs = tuple("*" if s.isdigit() else s for s in path)
         out.append((".".join(segs) if segs else "**", value))
     return out
@@ -1103,16 +1323,17 @@ def generate_policy(observed_tools: list[str],
     arg_rules: dict[str, dict] = {t: {"allow": {}, "deny": {}}
                                   for t in called}
     for (tool, gen_path), values in sorted(by_path.items()):
-        arg_rules[tool]["allow"][gen_path] = [_value_pattern(values)]
+        arg_rules[tool]["allow"][gen_path] = _value_rules(values)
     policy: dict = {
         "_comment": "generated by `mcp-jail learn` - tightest-fit "
                     "allowlist from observed traffic. Review before use: "
                     "it permits exactly what was seen, nothing more. "
                     "Only tools that were called are allowed; every "
-                    "argument value must match the allow pattern for its "
-                    "path; unseen paths are denied; a tool with no allow "
-                    "patterns accepts only empty arguments (strict_args) "
-                    "- set its allow to \"*\" to accept any.",
+                    "argument value must match the typed allow rule for "
+                    "its path; unseen paths are denied; a tool with no "
+                    "allow patterns accepts only empty arguments, {} "
+                    "(strict_args) - set its allow to \"*\" to accept any. "
+                    "Only tools/call is checked (policed_methods).",
         "allow_tools": called,
     }
     not_called = sorted(listed - set(called))
@@ -1121,6 +1342,8 @@ def generate_policy(observed_tools: list[str],
     policy.update({
         "deny_tools": [],
         "arg_rules": arg_rules,
+        "policed_methods": ["tools/call"],
+        "deny_methods": [],
         "strict_args": True,
         "audit_args": "denied",
         "hide_denied": True,
@@ -1135,6 +1358,7 @@ class _Recorder:
     def __init__(self):
         self.tools: list[str] = []
         self.calls: list[tuple[str, dict]] = []
+        self.protocol_version: str | None = None  # what the server answered
 
     def on_call(self, name, args) -> None:
         if not isinstance(args, dict):
@@ -1154,10 +1378,10 @@ class _Session:
 
     request() returns a discriminated tuple:
       ("ok", obj)   -- the response with the matching id arrived
-      ("closed",)   -- server closed stdout
+      ("closed",)   -- server closed stdout, or its stdin is gone
       ("timeout",)  -- nothing matching arrived within `timeout` seconds
-      ("bad", text) -- a non-JSON line arrived instead
-    Notifications are ignored; server-originated requests get a
+    Non-JSON lines on the server's stdout (banners) are logged and
+    skipped. Notifications are ignored; server-originated requests get a
     -32601 error so the server never waits on a client that isn't there.
     """
 
@@ -1168,8 +1392,21 @@ class _Session:
         self.closed = False
         _Reader(proc.stdout, "server", self.q).start()
 
+    def notify(self, msg: dict) -> bool:
+        """Send a notification (or any message) without waiting. False
+        when the server has gone (its stdin pipe is closed)."""
+        if self.closed:
+            return False
+        try:
+            self.out.send(msg)
+        except OSError:
+            self.closed = True
+            return False
+        return True
+
     def request(self, msg: dict, timeout: float):
-        self.out.send(msg)
+        if not self.notify(msg):
+            return ("closed",)
         want = _id_key(msg.get("id"))
         deadline = time.monotonic() + timeout
         while True:
@@ -1187,42 +1424,89 @@ class _Session:
                 return ("closed",)
             obj, code, _err = _parse(line)
             if code is not None:
-                return ("bad", line.decode("utf-8", "replace").strip())
+                print(f"learn: ignoring non-JSON line from server: "
+                      f"{_preview(line)}", file=sys.stderr)
+                continue
             if not isinstance(obj, dict):
                 continue
             if "method" in obj:
                 if obj.get("id") is not None:
-                    self.out.send(_rpc_error(obj["id"], -32601,
-                                             "mcp-jail learn: client requests "
-                                             "are not supported"))
+                    self.notify(_rpc_error(obj["id"], METHOD_NOT_FOUND,
+                                           "mcp-jail learn: client requests "
+                                           "are not supported"))
                 continue
             if "id" in obj and _id_key(obj["id"]) == want:
                 return ("ok", obj)
 
 
-def _learn_from_script(proc, script_path: str, timeout: float,
-                       rec: _Recorder) -> None:
-    """Drive canned calls against the server; no client needed. A call
-    is recorded only once the server answered it successfully."""
-    with open(script_path, encoding="utf-8") as f:
-        calls = json.load(f)
+def load_script(path: str) -> list[dict]:
+    """Read and validate a learn --script file: a JSON array of
+    {"tool": "<name>", "arguments": {...}} ("arguments" optional).
+    Raises ValueError (or OSError) with a message fit for the user."""
+    with open(path, encoding="utf-8") as f:
+        try:
+            calls = json.load(f)
+        except ValueError as e:
+            raise ValueError(f"not valid JSON ({e})") from None
     if not isinstance(calls, list):
-        raise ValueError("script must be a JSON array of "
-                         '{"tool": ..., "arguments": {...}}')
+        raise ValueError('must be a JSON array of {"tool": ..., '
+                         '"arguments": {...}}')
+    for i, call in enumerate(calls):
+        if not isinstance(call, dict):
+            raise ValueError(f"entry {i} is not an object")
+        if not isinstance(call.get("tool"), str) or not call["tool"]:
+            raise ValueError(f'entry {i} needs a "tool" name (string)')
+        if "arguments" in call and call["arguments"] is not None and not (
+                isinstance(call["arguments"], dict)):
+            raise ValueError(f'entry {i}: "arguments" must be a JSON object')
+    return calls
+
+
+def _learn_from_script(proc, calls: list[dict], timeout: float,
+                       rec: _Recorder) -> str | None:
+    """Drive canned calls against the server; no client needed. A call
+    is recorded only once the server answered it successfully. Returns
+    None when the script ran through, else why the session ended early
+    (the server refused initialize, or went away)."""
     session = _Session(proc)
-    session.request({"jsonrpc": "2.0", "id": "learn-init",
-                     "method": "initialize", "params": {}}, timeout)
+    status = session.request(
+        {"jsonrpc": "2.0", "id": "learn-init", "method": "initialize",
+         "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                    "clientInfo": {"name": "mcp-jail", "version": VERSION}}},
+        timeout)
+    if status[0] != "ok":
+        return (f"server did not answer initialize ({status[0]})"
+                if status[0] == "timeout" else
+                "server closed before answering initialize")
+    reply = status[1]
+    if "error" in reply:
+        err = reply["error"] if isinstance(reply["error"], dict) else {}
+        return (f"server refused initialize: {err.get('message', '?')} "
+                f"(code {err.get('code', '?')})")
+    result = reply.get("result")
+    version = result.get("protocolVersion") if isinstance(result, dict) else None
+    if isinstance(version, str):
+        rec.protocol_version = version
+        if version != PROTOCOL_VERSION:
+            print(f"learn: server speaks MCP {version} (offered "
+                  f"{PROTOCOL_VERSION}); continuing with the server's version",
+                  file=sys.stderr)
+    # MCP: the client confirms the handshake before any other request;
+    # an SDK server answers everything else with -32602 until it does.
+    if not session.notify({"jsonrpc": "2.0",
+                           "method": "notifications/initialized"}):
+        return "server closed during the handshake"
     status = session.request({"jsonrpc": "2.0", "id": "learn-list",
                               "method": "tools/list"}, timeout)
     if status[0] == "ok":
         rec.on_tools(status[1].get("result"))
     elif status[0] == "timeout":
         print("learn: tools/list timed out", file=sys.stderr)
+    else:
+        return "server closed before answering tools/list"
 
     for i, call in enumerate(calls):
-        if not isinstance(call, dict):
-            continue
-        name = call.get("tool", "")
+        name = call["tool"]
         args = call.get("arguments")
         if args is None:
             args = {}
@@ -1238,12 +1522,10 @@ def _learn_from_script(proc, script_path: str, timeout: float,
         elif status[0] == "timeout":
             print(f"learn: call {i} ({name!r}) timed out "
                   f"after {timeout}s", file=sys.stderr)
-        elif status[0] == "closed":
-            print("learn: server closed stdout", file=sys.stderr)
-            break
-        elif status[0] == "bad":
-            print(f"learn: call {i} ({name!r}): bad (non-JSON) response "
-                  f"from server", file=sys.stderr)
+        else:
+            return (f"server closed during call {i} ({name!r}); "
+                    f"{len(calls) - i} call(s) not driven")
+    return None
 
 
 def learn(server_cmd: list[str], script: str | None = None,
@@ -1255,14 +1537,36 @@ def learn(server_cmd: list[str], script: str | None = None,
     Live mode proxies stdin/stdout (everything allowed, nothing hidden)
     until stdin EOF or Ctrl-C.  Policy goes to stdout or --out; a summary
     goes to stderr.
+
+    Exit 2 without touching --out when the script or --out is unusable,
+    the server command is missing, or the session ended early (refused
+    handshake, server gone): whatever was learned by then goes to stdout
+    for review instead, so a failed run never overwrites a good policy.
     """
+    calls: list[dict] = []
     if script is not None:
         script = expand_path(script)
         if not os.path.exists(script):
             print(f"mcp-jail learn: no script at {script}", file=sys.stderr)
             return 2
+        try:
+            calls = load_script(script)
+        except (OSError, ValueError) as e:
+            print(f"mcp-jail learn: bad --script {script}: {e}",
+                  file=sys.stderr)
+            return 2
     if out:
         out = expand_path(out)
+        if os.path.isdir(out):
+            print(f"mcp-jail learn: --out {out} is a directory",
+                  file=sys.stderr)
+            return 2
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+        except OSError as e:
+            print(f"mcp-jail learn: cannot create the directory for "
+                  f"--out {out}: {e}", file=sys.stderr)
+            return 2
     rec = _Recorder()
     try:
         proc = _spawn(server_cmd)
@@ -1270,9 +1574,10 @@ def learn(server_cmd: list[str], script: str | None = None,
         print(f"mcp-jail learn: server command not found: {e} "
               f"(not on PATH)", file=sys.stderr)
         return 2
+    failure: str | None = None
     try:
         if script is not None:
-            _learn_from_script(proc, script, timeout, rec)
+            failure = _learn_from_script(proc, calls, timeout, rec)
         else:
             try:
                 _Proxy(proc, stdin or sys.stdin, stdout or sys.stdout,
@@ -1283,15 +1588,35 @@ def learn(server_cmd: list[str], script: str | None = None,
         _stop(proc)
     policy = generate_policy(rec.tools, rec.calls)
     text = json.dumps(policy, indent=2)
-    if out:
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(text + "\n")
-        print(f"learn: wrote {out}", file=sys.stderr)
+    code = 0
+    if failure:
+        code = 2
+        print(f"learn: {failure}", file=sys.stderr)
+        if rec.calls:
+            print("learn: partial policy follows on stdout (--out not "
+                  "written); review before use", file=sys.stderr)
+            print(text)
+        else:
+            print("learn: nothing learned; no policy written",
+                  file=sys.stderr)
+    elif out:
+        try:
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(text + "\n")
+            print(f"learn: wrote {out}", file=sys.stderr)
+        except OSError as e:
+            code = 2
+            print(f"learn: cannot write {out}: {e}; policy follows on "
+                  f"stdout", file=sys.stderr)
+            print(text)
     else:
         print(text)
     n_listed = len(set(rec.tools))
     n_called = len({t for t, _ in rec.calls})
+    spoke = (f" (server speaks MCP {rec.protocol_version})"
+             if rec.protocol_version else "")
     print(f"learn: {n_listed} tool(s) listed by the server, "
           f"{n_called} tool(s) called in {len(rec.calls)} successful "
-          f"call(s); allowlisted the {n_called} called", file=sys.stderr)
-    return 0
+          f"call(s); allowlisted the {n_called} called{spoke}",
+          file=sys.stderr)
+    return code

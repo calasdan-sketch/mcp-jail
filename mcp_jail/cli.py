@@ -12,13 +12,25 @@ finds the problems; mcp-jail enforces least-privilege at runtime.
 from __future__ import annotations
 
 import argparse
+import errno
 import json
 import os
 import sys
 
+from . import VERSION
 from . import jail as jail_mod
 
-VERSION = "0.4.0"
+
+def _broken_pipe() -> int:
+    """stdout's reader went away (`mcp-jail --audit | head`): leave
+    quietly. stdout is pointed at the null device first so the
+    interpreter's exit-time flush cannot raise the same error again."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+    except (OSError, ValueError, AttributeError):
+        pass
+    return 0
 
 
 def _harden_streams() -> None:
@@ -67,7 +79,10 @@ def cmd_audit(args) -> int:
         mark = "DENY " if e.get("decision") == "deny" else "allow"
         if e.get("decision") == "deny":
             denies += 1
-        print(f"{mark} {e.get('tool')} {e.get('reason', '')}")
+        what = e.get("tool")
+        if what is None:  # a whole method refused by deny_methods
+            what = f"method {e.get('method')}"
+        print(f"{mark} {what} {e.get('reason', '')}")
     print(f"\n{denies} denied in last {len(lines)} calls")
     return 0
 
@@ -138,9 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv=None) -> int:
-    _harden_streams()
-    argv = list(sys.argv[1:] if argv is None else argv)
+def _main(argv: list[str]) -> int:
     if argv[:1] == ["learn"]:
         return cmd_learn(argv[1:])
     args = build_parser().parse_args(argv)
@@ -156,6 +169,20 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
     return jail_mod.run(args.policy, cmd, timeout=args.timeout)
+
+
+def main(argv=None) -> int:
+    _harden_streams()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        return _main(argv)
+    except BrokenPipeError:
+        return _broken_pipe()
+    except OSError as e:
+        # Windows reports a closed pipe as EINVAL, not EPIPE
+        if os.name == "nt" and e.errno == errno.EINVAL:
+            return _broken_pipe()
+        raise
 
 
 if __name__ == "__main__":

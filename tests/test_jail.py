@@ -7,6 +7,7 @@ reads or writes the real user's ~/.mcp-jail.
 """
 
 import argparse
+import importlib.util
 import io
 import json
 import os
@@ -20,6 +21,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest import mock
 
 from mcp_jail import cli as cli_mod
 from mcp_jail import jail as jail_mod
@@ -436,8 +438,22 @@ class TestArgRulePaths(unittest.TestCase):
         self.assertFalse(jail_mod.tool_allowed(
             pol, "read_file", {"path": {"$ref": "/tmp/a"}})[0])
         self.assertTrue(jail_mod.tool_allowed(pol, "read_file", {})[0])
+        # an empty object/array is a value too (round 4): it needs a rule
+        # at its path like any other value - unknown keys never slip in
+        for extra in ({"tags": []}, {"opts": {}}):
+            ok, reason = jail_mod.tool_allowed(
+                pol, "read_file", {"path": "/tmp/a", **extra})
+            self.assertFalse(ok, extra)
+            self.assertIn("matches no allow pattern", reason)
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {
+            "read_file": {"allow": {"path": ["^/tmp/"],
+                                    "tags": [{"type": "array"}]}}}})
         self.assertTrue(jail_mod.tool_allowed(
             pol, "read_file", {"path": "/tmp/a", "tags": []})[0])
+        self.assertFalse(jail_mod.tool_allowed(
+            pol, "read_file", {"path": "/tmp/a", "tags": ["x"]})[0])
+        self.assertFalse(jail_mod.tool_allowed(
+            pol, "read_file", {"path": "/tmp/a", "tags": {}})[0])
 
     def test_scalars_are_matched_as_json_text(self):
         pol = compiled({"allow_tools": ["*"], "arg_rules": {
@@ -891,21 +907,27 @@ class TestHardening(ProxyCase):
     """Round-3 panel findings: response handling must never kill the proxy."""
 
     def test_v9_bad_response_line(self):
-        # V9: non-JSON line from the server -> JSON-RPC error, proxy alive
+        # V9: a non-JSON line from the server answers nothing (round 4:
+        # it is logged and skipped, not charged to a pending request);
+        # the call it never answered is caught by --timeout, proxy alive
         server = self.srv(FAKE_FLAKY, "flaky.py")
         pol = write_policy(self.tmp, ALLOW_ALL)
-        resps = drive_jail(pol, server, [
-            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-             "params": {"name": "garbage", "arguments": {}}},
-            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
-             "params": {"name": "read_file", "arguments": {}}},
-        ])
-        self.assertEqual(len(resps), 2)
-        self.assertIn("error", resps[0])
-        self.assertEqual(resps[0]["error"]["code"], -32603)
-        self.assertIn("bad response", resps[0]["error"]["message"])
+        err = io.StringIO()
+        with redirect_stderr(err):
+            resps = drive_jail(pol, server, [
+                {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                 "params": {"name": "garbage", "arguments": {}}},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                 "params": {"name": "read_file", "arguments": {}}},
+            ], timeout=1.0)
+        by_id = {r["id"]: r for r in resps}
+        self.assertEqual(set(by_id), {1, 2})
+        self.assertEqual(by_id[1]["error"]["code"], -32603)
+        self.assertIn("timed out", by_id[1]["error"]["message"])
+        self.assertIn("ignoring non-JSON line", err.getvalue())
+        self.assertIn("THIS IS NOT JSON", err.getvalue())
         # proxy survived: the next call still works
-        self.assertEqual(resps[1].get("result"), {"ok": True})
+        self.assertEqual(by_id[2].get("result"), {"ok": True})
 
     def test_v10_server_timeout(self):
         # V10: server that never responds -> timeout error, no hang
@@ -1118,8 +1140,9 @@ class TestLearn(ProxyCase):
         pol = json.loads(out.getvalue())
         self.assertEqual(pol["allow_tools"], ["read_file"])
         self.assertEqual(pol["arg_rules"]["read_file"]["allow"],
-                         {"path": ["^" + jail_mod._TRAVERSAL_GUARD
-                                   + "/tmp/[a-z]*$"]})
+                         {"path": [{"type": "string",
+                                    "pattern": r"\A" + jail_mod._TRAVERSAL_GUARD
+                                    + r"/tmp/[a-z]*\Z"}]})
 
     def test_learn_live_mode_records_and_passes_through(self):
         inp = io.BytesIO(("\n".join(json.dumps(r) for r in [
@@ -1145,8 +1168,9 @@ class TestLearn(ProxyCase):
         # reported for the reviewer and denied
         self.assertEqual(pol["allow_tools"], ["run_cmd"])
         self.assertEqual(pol["_not_called"], ["delete_all", "read_file"])
-        self.assertEqual(pol["arg_rules"], {"run_cmd": {"allow": {"cmd": ["^ls$"]},
-                                                        "deny": {}}})
+        self.assertEqual(pol["arg_rules"], {"run_cmd": {
+            "allow": {"cmd": [{"type": "string", "pattern": r"\Als\Z"}]},
+            "deny": {}}})
 
 
 # --------------------------------------------------------------------------
@@ -1414,8 +1438,10 @@ class TestTraversal(unittest.TestCase):
         gen = jail_mod.generate_policy([], [
             ("read_file", {"path": p}) for p in
             ("/srv/data/a/x.txt", "/srv/data/b/y.txt", "/srv/data/c/z.txt")])
-        pat = gen["arg_rules"]["read_file"]["allow"]["path"][0]
-        self.assertTrue(pat.startswith("^" + jail_mod._TRAVERSAL_GUARD + "/srv/data/"))
+        rule = gen["arg_rules"]["read_file"]["allow"]["path"][0]
+        self.assertEqual(rule["type"], "string")
+        pat = rule["pattern"]
+        self.assertTrue(pat.startswith(r"\A" + jail_mod._TRAVERSAL_GUARD + "/srv/data/"))
         # the regex alone, as any other consumer of the policy would use it
         self.assertIsNone(re.search(pat, "/srv/data/../../etc/passwd"))
         self.assertIsNotNone(re.search(pat, "/srv/data/d/w.txt"))
@@ -1850,6 +1876,767 @@ class TestDocs(unittest.TestCase):
         for flag in ("--init-policy", "--force", "--audit", "--limit", "--policy"):
             self.assertIn(flag, text)
         self.assertIn("mcp-jail learn", text)
+
+
+# --------------------------------------------------------------------------
+# Round 4 panel findings
+# --------------------------------------------------------------------------
+
+HAVE_MCP = importlib.util.find_spec("mcp") is not None
+
+# A real MCP server on the official Python SDK (mcp 2.x MCPServer, or
+# 1.x FastMCP). `--banner` makes it print a startup line to STDOUT first,
+# as many npm servers do.
+REAL_SDK_SERVER = r"""
+import sys
+try:
+    from mcp.server.mcpserver import MCPServer as Server   # mcp >= 2
+except ImportError:
+    from mcp.server.fastmcp import FastMCP as Server       # mcp 1.x
+mcp = Server("realsrv")
+
+@mcp.tool()
+def echo(text: str, count: int = 1) -> str:
+    "Echo text."
+    return text * count
+
+@mcp.tool()
+def delete_all() -> str:
+    "Pretend to delete everything."
+    return "boom"
+
+if "--banner" in sys.argv:
+    sys.stdout.write("realsrv starting on stdio...\n")
+    sys.stdout.flush()
+mcp.run()
+"""
+
+# Behaves like an SDK server on the handshake: initialize must carry
+# protocolVersion/capabilities/clientInfo, and until the client's
+# notifications/initialized arrives every other request gets -32602.
+# Logs every line it receives to argv[1]; argv[2] == "refuse" makes it
+# refuse initialize outright; "quit" makes it exit right after it.
+FAKE_STRICT = r"""
+import json, sys
+log = open(sys.argv[1], "a", encoding="utf-8")
+mode = sys.argv[2] if len(sys.argv) > 2 else ""
+TOOLS = [{"name": "echo"}, {"name": "delete_all"}]
+initialized = False
+def send(r):
+    sys.stdout.write(json.dumps(r) + "\n"); sys.stdout.flush()
+def bad(rid):
+    return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "Invalid request parameters"}}
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    log.write(line + "\n"); log.flush()
+    req = json.loads(line)
+    m, rid = req.get("method"), req.get("id")
+    if m == "notifications/initialized":
+        initialized = True
+        continue
+    if rid is None:
+        continue
+    if m == "initialize":
+        p = req.get("params") or {}
+        if mode == "refuse":
+            send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": "unsupported protocol version"}})
+        elif not (isinstance(p.get("protocolVersion"), str) and isinstance(p.get("capabilities"), dict)
+                  and isinstance(p.get("clientInfo"), dict)):
+            send(bad(rid))
+        else:
+            send({"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-03-26",
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "strict", "version": "1"}}})
+        if mode == "quit":
+            sys.exit(0)
+    elif not initialized:
+        send(bad(rid))
+    elif m == "tools/list":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}})
+    elif m == "tools/call":
+        send({"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "ok"}]}})
+    else:
+        send({"jsonrpc": "2.0", "id": rid, "result": {}})
+"""
+
+# Prints a banner to stdout at startup and a log line before every
+# response (console.log-style). The tool "dup" is answered with a
+# duplicate-key document; "resource" style requests get a result too.
+FAKE_BANNER = r"""
+import json, sys
+sys.stdout.write("banner server starting on stdio...\n"); sys.stdout.flush()
+TOOLS = [{"name": "read_file"}, {"name": "dup"}, {"name": "delete_all"}]
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    m, rid = req.get("method"), req.get("id")
+    if rid is None:
+        continue
+    sys.stdout.write("[log] handling %s\n" % m); sys.stdout.flush()
+    if m == "initialize":
+        r = {"jsonrpc": "2.0", "id": rid, "result": {"protocolVersion": "2025-06-18", "capabilities": {}}}
+    elif m == "tools/list":
+        r = {"jsonrpc": "2.0", "id": rid, "result": {"tools": TOOLS}}
+    elif m == "tools/call" and req["params"]["name"] == "dup":
+        sys.stdout.write('{"jsonrpc":"2.0","id":%s,"result":{"a":1,"a":2}}\n' % json.dumps(rid)); sys.stdout.flush()
+        continue
+    else:
+        r = {"jsonrpc": "2.0", "id": rid, "result": {"content": [{"type": "text", "text": "did:" + str(m)}]}}
+    sys.stdout.write(json.dumps(r) + "\n"); sys.stdout.flush()
+"""
+
+
+def init_request(req_id=1) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "method": "initialize",
+            "params": {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "test", "version": "0"}}}
+
+
+def write_script(tmp: str, calls: list) -> str:
+    p = os.path.join(tmp, "calls.json")
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(calls, f)
+    return p
+
+
+class TestLearnHandshake(ProxyCase):
+    """R4-1: learn speaks MCP. `initialize` with empty params and no
+    `notifications/initialized` made every SDK-based server answer
+    -32602 to everything: 0 tools listed, 0 called, empty policy."""
+
+    def test_fake_sdk_like_server_gets_a_full_handshake(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_STRICT, "strict.py")
+        script = write_script(self.tmp, [{"tool": "echo", "arguments": {"text": "hi"}}])
+        out = os.path.join(self.tmp, "gen.json")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = jail_mod.learn([sys.executable, srv, log], script=script,
+                                  out=out, timeout=10)
+        self.assertEqual(code, 0, err.getvalue())
+        with open(out, encoding="utf-8") as f:
+            pol = json.load(f)
+        self.assertEqual(pol["allow_tools"], ["echo"])
+        self.assertEqual(pol["_not_called"], ["delete_all"])
+        self.assertIn("2 tool(s) listed", err.getvalue())
+        # the server's protocol revision is reported, not silently assumed
+        self.assertIn("2025-03-26", err.getvalue())
+        with open(log, encoding="utf-8") as f:
+            seen = [json.loads(l) for l in f if l.strip()]
+        methods = [m.get("method") for m in seen]
+        self.assertEqual(methods[:3], ["initialize", "notifications/initialized",
+                                       "tools/list"])
+        init = seen[0]["params"]
+        self.assertEqual(init["protocolVersion"], jail_mod.PROTOCOL_VERSION)
+        self.assertEqual(init["capabilities"], {})
+        self.assertEqual(init["clientInfo"]["name"], "mcp-jail")
+        self.assertEqual(init["clientInfo"]["version"], cli_mod.VERSION)
+        self.assertNotIn("id", seen[1])  # a notification, never a request
+
+    def test_initialize_error_stops_learn_cleanly(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_STRICT, "strict.py")
+        script = write_script(self.tmp, [{"tool": "echo", "arguments": {"text": "hi"}}])
+        out = os.path.join(self.tmp, "gen.json")
+        err, outbuf = io.StringIO(), io.StringIO()
+        with redirect_stderr(err), redirect_stdout(outbuf):
+            code = jail_mod.learn([sys.executable, srv, log, "refuse"],
+                                  script=script, out=out, timeout=10)
+        self.assertEqual(code, 2)
+        self.assertIn("refused initialize", err.getvalue())
+        self.assertIn("unsupported protocol version", err.getvalue())
+        self.assertNotIn("Traceback", err.getvalue())
+        self.assertFalse(os.path.exists(out), "an empty policy was written")
+        self.assertEqual(outbuf.getvalue(), "")
+        with open(log, encoding="utf-8") as f:
+            seen = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual([m.get("method") for m in seen], ["initialize"])
+
+    @unittest.skipUnless(HAVE_MCP, "official MCP Python SDK not installed")
+    def test_learn_against_a_real_sdk_server(self):
+        srv = self.srv(REAL_SDK_SERVER, "realsrv.py")
+        script = write_script(self.tmp, [
+            {"tool": "echo", "arguments": {"text": "hi", "count": 2}},
+            {"tool": "echo", "arguments": {"text": "ho"}}])
+        out = os.path.join(self.tmp, "gen.json")
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = jail_mod.learn([sys.executable, srv], script=script,
+                                  out=out, timeout=30)
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertIn("2 tool(s) listed", err.getvalue())
+        self.assertIn("1 tool(s) called in 2 successful", err.getvalue())
+        pol = jail_mod.load_policy(out)
+        self.assertEqual(pol["allow_tools"], ["echo"])
+        self.assertEqual(pol["_not_called"], ["delete_all"])
+        self.assertTrue(jail_mod.tool_allowed(
+            pol, "echo", {"text": "hi", "count": 3})[0])
+        self.assertFalse(jail_mod.tool_allowed(
+            pol, "echo", {"text": "hi", "count": "3"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "delete_all", {})[0])
+
+    @unittest.skipUnless(HAVE_MCP, "official MCP Python SDK not installed")
+    def test_proxy_passes_a_real_sdk_session(self):
+        srv = self.srv(REAL_SDK_SERVER, "realsrv.py")
+        pol = write_policy(self.tmp, {"allow_tools": ["*"],
+                                      "deny_tools": ["delete_all"],
+                                      "arg_rules": {}, "hide_denied": True})
+        resps = drive_jail(pol, srv, [
+            init_request(1),
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            call(3, "echo", {"text": "hi", "count": 2}),
+            call(4, "delete_all", {}),
+        ], timeout=30)
+        by_id = {r["id"]: r for r in resps if "id" in r}
+        self.assertEqual(set(by_id), {1, 2, 3, 4}, resps)
+        self.assertIn("protocolVersion", by_id[1]["result"])
+        self.assertEqual([t["name"] for t in by_id[2]["result"]["tools"]], ["echo"])
+        self.assertEqual(by_id[3]["result"]["content"][0]["text"], "hihi")
+        self.assertIn("denied", by_id[4]["error"]["message"])
+
+
+class TestWindowsTraversal(unittest.TestCase):
+    """R4-2: the learned traversal guard only knew `/`, and the matcher
+    skipped its own backslash-aware veto for every guarded pattern (the
+    guard itself spells `\\.\\.`): a learned Windows pattern admitted
+    C:\\Users\\dan\\proj\\../.ssh/id_rsa."""
+
+    WIN = ["C:\\Users\\dan\\proj\\a/b.txt", "C:\\Users\\dan\\proj\\c.txt"]
+
+    def test_learned_windows_pattern_blocks_backslash_dotdot(self):
+        gen = jail_mod.generate_policy([], [("read_file", {"path": p}) for p in self.WIN])
+        pat = gen["arg_rules"]["read_file"]["allow"]["path"][0]["pattern"]
+        self.assertTrue(pat.startswith(r"\A" + jail_mod._TRAVERSAL_GUARD))
+        pol = compiled(gen)
+        self.assertTrue(jail_mod.tool_allowed(
+            pol, "read_file", {"path": "C:\\Users\\dan\\proj\\x.txt"})[0])
+        for bad in ("C:\\Users\\dan\\proj\\../.ssh/id_rsa", "C:\\Users\\dan\\proj\\..",
+                    "C:\\Users\\dan\\proj\\..\\.ssh\\id_rsa", "C:\\Users\\dan\\proj\\a/../../x"):
+            ok, reason = jail_mod.tool_allowed(pol, "read_file", {"path": bad})
+            self.assertFalse(ok, bad)
+            self.assertIn("'..'", reason)
+            # the regex alone refuses it too (policy file honest on its own)
+            self.assertIsNone(re.search(pat, bad), bad)
+
+    def test_guard_in_a_hand_written_pattern_is_not_an_opt_in(self):
+        guarded = "^" + jail_mod._TRAVERSAL_GUARD + r"C:\\x\\[a-zA-Z0-9_/.-]*$"
+        old_guarded = "^" + jail_mod._OLD_TRAVERSAL_GUARD + r"C:\\x\\[a-zA-Z0-9_/.-]*$"
+        for pat in (guarded, old_guarded):
+            pol = compiled({"allow_tools": ["*"], "arg_rules": {
+                "r": {"allow": {"p": [pat]}}}})
+            self.assertTrue(jail_mod.tool_allowed(pol, "r", {"p": "C:\\x\\y"})[0])
+            for bad in ("C:\\x\\../y", "C:\\x\\..", "C:\\x\\..\\y"):
+                ok, reason = jail_mod.tool_allowed(pol, "r", {"p": bad})
+                self.assertFalse(ok, (pat, bad))
+                self.assertIn("'..'", reason)
+        # spelling \.\. OUTSIDE the guard is the opt-in, as documented
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {
+            "r": {"allow": {"p": [r"^C:\\x\\\.\.\\shared\\[a-z]+$"]}}}})
+        self.assertTrue(jail_mod.tool_allowed(pol, "r", {"p": "C:\\x\\..\\shared\\a"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "r", {"p": "C:\\x\\..\\other\\a"})[0])
+        self.assertTrue(jail_mod._opts_into_dotdot(r"^/tmp/\.\./x$"))
+        self.assertFalse(jail_mod._opts_into_dotdot(jail_mod._TRAVERSAL_GUARD + "x"))
+        self.assertFalse(jail_mod._opts_into_dotdot(jail_mod._OLD_TRAVERSAL_GUARD + "x"))
+
+
+class TestServerBannerLines(ProxyCase):
+    """R4-3: a non-JSON line on the server's stdout answers nothing. It
+    used to fail the longest-waiting request, whose real answer was then
+    dropped as unknown — every npm server that console.log()s a banner
+    broke the handshake."""
+
+    def test_banner_and_log_lines_are_ignored_and_responses_delivered(self):
+        srv = self.srv(FAKE_BANNER, "banner.py")
+        pol = write_policy(self.tmp, {"allow_tools": ["*"],
+                                      "deny_tools": ["delete_all"],
+                                      "arg_rules": {}, "hide_denied": True})
+        err = io.StringIO()
+        with redirect_stderr(err):
+            resps = drive_jail(pol, srv, [
+                init_request(1),
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+                call(3, "read_file", {"path": "/tmp/a"}),
+            ], timeout=10)
+        by_id = {r["id"]: r for r in resps}
+        self.assertEqual(set(by_id), {1, 2, 3}, resps)
+        self.assertEqual(by_id[1]["result"]["protocolVersion"], "2025-06-18")
+        self.assertEqual([t["name"] for t in by_id[2]["result"]["tools"]],
+                         ["read_file", "dup"])
+        self.assertEqual(by_id[3]["result"]["content"][0]["text"], "did:tools/call")
+        self.assertNotIn("dropping response", err.getvalue())
+        self.assertIn("ignoring non-JSON line from server: 'banner server starting",
+                      err.getvalue())
+
+    def test_duplicate_key_response_fails_its_own_request_by_id(self):
+        srv = self.srv(FAKE_BANNER, "banner.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        with redirect_stderr(io.StringIO()):
+            resps = drive_jail(pol, srv, [
+                call(1, "dup", {}),
+                call(2, "read_file", {}),
+            ], timeout=10)
+        by_id = {r["id"]: r for r in resps}
+        self.assertEqual(set(by_id), {1, 2})
+        self.assertEqual(by_id[1]["error"]["code"], -32603)
+        self.assertIn("duplicate key", by_id[1]["error"]["message"])
+        self.assertIn("result", by_id[2])
+
+    def test_learn_script_mode_ignores_banner_lines(self):
+        srv = self.srv(FAKE_BANNER, "banner.py")
+        script = write_script(self.tmp, [{"tool": "read_file", "arguments": {"path": "/tmp/a"}}])
+        err, out = io.StringIO(), io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            code = jail_mod.learn([sys.executable, srv], script=script, timeout=10)
+        self.assertEqual(code, 0, err.getvalue())
+        pol = json.loads(out.getvalue())
+        self.assertEqual(pol["allow_tools"], ["read_file"])
+        self.assertIn("3 tool(s) listed", err.getvalue())
+        self.assertIn("ignoring non-JSON line", err.getvalue())
+        self.assertNotIn("bad (non-JSON) response", err.getvalue())
+
+    @unittest.skipUnless(HAVE_MCP, "official MCP Python SDK not installed")
+    def test_real_sdk_server_with_a_stdout_banner(self):
+        srv = self.srv(REAL_SDK_SERVER, "realsrv.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        with redirect_stderr(io.StringIO()):
+            resps = drive_jail(pol, srv, [
+                init_request(1),
+                {"jsonrpc": "2.0", "method": "notifications/initialized"},
+                {"jsonrpc": "2.0", "id": 2, "method": "tools/list"},
+            ], timeout=30, server_args=["--banner"])
+        by_id = {r["id"]: r for r in resps if "id" in r}
+        self.assertEqual(set(by_id), {1, 2}, resps)
+        self.assertIn("result", by_id[1])
+        self.assertEqual(sorted(t["name"] for t in by_id[2]["result"]["tools"]),
+                         ["delete_all", "echo"])
+
+
+class TestLearnRobustness(ProxyCase):
+    """R4-4: learn never ends in a traceback - not when the server exits
+    early, not on a bad --script, and --out is checked before the
+    session so a learned policy is never lost."""
+
+    def _learn(self, server_cmd, **kw):
+        err, out = io.StringIO(), io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            code = jail_mod.learn(server_cmd, **kw)
+        self.assertNotIn("Traceback", err.getvalue())
+        return code, err.getvalue(), out.getvalue()
+
+    def test_server_exiting_early_is_a_clean_exit_2(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_STRICT, "strict.py")
+        script = write_script(self.tmp, [{"tool": "echo", "arguments": {"text": "hi"}}])
+        out = os.path.join(self.tmp, "gen.json")
+        code, err, _ = self._learn([sys.executable, srv, log, "quit"],
+                                   script=script, out=out, timeout=10)
+        self.assertEqual(code, 2)
+        self.assertIn("server closed", err)
+        self.assertFalse(os.path.exists(out))
+        # the same with the session API: a write to a dead server is
+        # ("closed",), not BrokenPipeError
+        proc = jail_mod._spawn([sys.executable, "-c", "pass"])
+        try:
+            proc.wait(timeout=10)
+            session = jail_mod._Session(proc)
+            self.assertEqual(session.request({"jsonrpc": "2.0", "id": 1,
+                                              "method": "ping"}, 2)[0], "closed")
+            self.assertFalse(session.notify({"jsonrpc": "2.0", "method": "x"}))
+        finally:
+            jail_mod._stop(proc)
+
+    def test_partial_policy_goes_to_stdout_when_the_server_dies_midway(self):
+        # the quitting server answers initialize then exits; nothing is
+        # learned. A server dying mid-script leaves what was learned.
+        srv = self.srv("import json, sys\n"
+                       "for line in sys.stdin:\n"
+                       "    req = json.loads(line)\n"
+                       "    if req.get('id') is None: continue\n"
+                       "    if req.get('method') == 'tools/call' and req['params']['name'] == 'die':\n"
+                       "        sys.exit(0)\n"
+                       "    r = {'jsonrpc': '2.0', 'id': req['id'], 'result': {'protocolVersion': '2025-06-18', 'tools': [], 'content': []}}\n"
+                       "    sys.stdout.write(json.dumps(r) + '\\n'); sys.stdout.flush()\n",
+                       "midway.py")
+        script = write_script(self.tmp, [{"tool": "ok", "arguments": {"n": 1}},
+                                         {"tool": "die"}, {"tool": "never"}])
+        out = os.path.join(self.tmp, "gen.json")
+        code, err, stdout = self._learn([sys.executable, srv], script=script,
+                                        out=out, timeout=10)
+        self.assertEqual(code, 2)
+        self.assertIn("server closed during call 1 ('die'); 2 call(s) not driven", err)
+        self.assertIn("partial policy", err)
+        self.assertFalse(os.path.exists(out), "--out written from a failed session")
+        pol = json.loads(stdout)
+        self.assertEqual(pol["allow_tools"], ["ok"])
+
+    def test_out_directory_is_created_up_front_or_refused(self):
+        script = write_script(self.tmp, [{"tool": "read_file", "arguments": {"path": "/tmp/a"}}])
+        out = os.path.join(self.tmp, "new", "deeper", "policy.json")
+        code, err, _ = self._learn([sys.executable, self.server], script=script,
+                                   out=out, timeout=10)
+        self.assertEqual(code, 0, err)
+        self.assertTrue(os.path.isfile(out))
+        # --out naming a directory, or living under a file, is refused
+        # BEFORE the server is spawned (a missing command is not reached)
+        missing = "mcp-jail-no-such-command-xyz"
+        for bad in (self.tmp, os.path.join(script, "policy.json")):
+            code, err, _ = self._learn([missing], script=script, out=bad)
+            self.assertEqual(code, 2, bad)
+            self.assertIn("--out", err)
+            self.assertNotIn("not found", err)
+
+    def test_failed_final_write_prints_the_policy_instead_of_losing_it(self):
+        script = write_script(self.tmp, [{"tool": "read_file", "arguments": {"path": "/tmp/a"}}])
+        out = os.path.join(self.tmp, "gen.json")
+        real_open = open
+
+        def flaky_open(path, *a, **kw):
+            if path == out:
+                raise OSError(28, "No space left on device")
+            return real_open(path, *a, **kw)
+
+        with mock.patch("mcp_jail.jail.open", flaky_open, create=True):
+            code, err, stdout = self._learn([sys.executable, self.server],
+                                            script=script, out=out, timeout=10)
+        self.assertEqual(code, 2)
+        self.assertIn("cannot write", err)
+        self.assertIn("policy follows on stdout", err)
+        self.assertEqual(json.loads(stdout)["allow_tools"], ["read_file"])
+
+    def test_bad_script_is_refused_before_the_session(self):
+        missing = "mcp-jail-no-such-command-xyz"
+        cases = {
+            "notjson.json": ("not json", "not valid JSON"),
+            "object.json": ('{"tool": "x"}', "must be a JSON array"),
+            "noname.json": ('[{"arguments": {}}]', 'entry 0 needs a "tool" name'),
+            "badargs.json": ('[{"tool": "x", "arguments": [1]}]', '"arguments" must be a JSON object'),
+            "notobj.json": ('[1]', "entry 0 is not an object"),
+        }
+        for name, (text, expect) in cases.items():
+            p = os.path.join(self.tmp, name)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+            code, err, _ = self._learn([missing], script=p)
+            self.assertEqual(code, 2, name)
+            self.assertIn("bad --script", err)
+            self.assertIn(expect, err)
+            self.assertNotIn("not found", err)  # never got as far as spawning
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(cli_mod.main(["learn", "--script", os.path.join(self.tmp, "notjson.json"),
+                                           "--", missing]), 2)
+        # a good script with optional arguments is fine
+        good = write_script(self.tmp, [{"tool": "ping"}, {"tool": "x", "arguments": None}])
+        self.assertEqual(len(jail_mod.load_script(good)), 2)
+
+
+class TestEndAnchors(unittest.TestCase):
+    """R4-5: `re`'s `$` also matches before a trailing newline, so a
+    learned `^ls$` admitted "ls\\n". Learned patterns are \\A...\\Z and
+    the matcher reads `$` in any allow pattern as end-of-string."""
+
+    def test_trailing_newline_is_not_admitted(self):
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {
+            "run": {"allow": {"cmd": ["^hi$"], "alt": ["^(?:a|b)$"]}}}})
+        self.assertTrue(jail_mod.tool_allowed(pol, "run", {"cmd": "hi"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "run", {"cmd": "hi\n"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "run", {"cmd": "hi\nrm -rf /"})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "run", {"alt": "b"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "run", {"alt": "b\n"})[0])
+        gen = compiled(jail_mod.generate_policy([], [("run", {"cmd": "ls"})]))
+        self.assertEqual(gen["arg_rules"]["run"]["allow"][0].pattern.pattern, r"\Als\Z")
+        self.assertTrue(jail_mod.tool_allowed(gen, "run", {"cmd": "ls"})[0])
+        self.assertFalse(jail_mod.tool_allowed(gen, "run", {"cmd": "ls\n"})[0])
+
+    def test_dollar_rewrite_leaves_literals_and_classes_alone(self):
+        f = jail_mod._strict_end_anchors
+        self.assertEqual(f("^hi$"), r"^hi\Z")
+        self.assertEqual(f("^(?:a$|b$)"), r"^(?:a\Z|b\Z)")
+        self.assertEqual(f(r"^\$5$"), r"^\$5\Z")       # escaped: a literal dollar
+        self.assertEqual(f("^[$]$"), r"^[$]\Z")        # inside a class: literal
+        self.assertEqual(f("^[^]$]+$"), r"^[^]$]+\Z")  # `]` first in a class
+        self.assertEqual(f(r"^\\$"), r"^\\\Z")         # escaped backslash, then $
+        self.assertEqual(f("^/tmp/"), "^/tmp/")
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {
+            "t": {"allow": {"p": [r"^\$[0-9]+$", "^[$a-z]+$"]}}}})
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"p": "$12"})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"p": "a$b"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"p": "$12\n"})[0])
+        # deny patterns are untouched (search semantics, fail closed)
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {"t": {"deny": ["^rm$"]}}})
+        self.assertEqual(pol["arg_rules"]["t"]["deny"][0].pattern.pattern, "^rm$")
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"p": "rm\n"})[0])
+
+
+class TestTypedRules(unittest.TestCase):
+    """R4-6: scalars were compared as text, so "3" passed a learned
+    number pattern. Learned rules carry the JSON type; hand-written plain
+    patterns keep matching any scalar by its text."""
+
+    def test_learned_rules_pin_the_type(self):
+        gen = jail_mod.generate_policy([], [
+            ("t", {"n": 3, "b": True, "z": None, "s": "3", "e": {}, "l": []})])
+        allow = gen["arg_rules"]["t"]["allow"]
+        self.assertEqual(allow["n"], [{"type": "number", "pattern": jail_mod._NUMBER_PATTERN}])
+        self.assertEqual(allow["b"], [{"type": "boolean", "pattern": r"\A(?:true|false)\Z"}])
+        self.assertEqual(allow["z"], [{"type": "null", "pattern": r"\Anull\Z"}])
+        self.assertEqual(allow["s"], [{"type": "string", "pattern": r"\A3\Z"}])
+        self.assertEqual(allow["e"], [{"type": "object", "pattern": r"\A\{\}\Z"}])
+        self.assertEqual(allow["l"], [{"type": "array", "pattern": r"\A\[\]\Z"}])
+        pol = compiled(gen)
+        good = {"n": 3, "b": True, "z": None, "s": "3", "e": {}, "l": []}
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", good)[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {**good, "n": -2.5e3, "b": False})[0])
+        for key, bad in (("n", "3"), ("b", "true"), ("z", "null"), ("s", 3),
+                         ("n", True), ("e", []), ("l", {}), ("e", {"k": 1}), ("l", ["x"])):
+            ok, reason = jail_mod.tool_allowed(pol, "t", {**good, key: bad})
+            self.assertFalse(ok, (key, bad))
+            self.assertIn(key, reason)
+        # a path seen with two types gets one typed rule per type
+        gen = jail_mod.generate_policy([], [("t", {"v": 1}), ("t", {"v": "one"})])
+        self.assertEqual([r["type"] for r in gen["arg_rules"]["t"]["allow"]["v"]],
+                         ["number", "string"])
+        pol = compiled(gen)
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"v": 7})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"v": "one"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"v": "7"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"v": True})[0])
+
+    def test_hand_written_rules(self):
+        # plain patterns: any scalar, by text (backward compatible)
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {
+            "t": {"allow": {"n": [r"^\d+$"]}}}})
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"n": 3})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"n": "3"})[0])
+        # typed: type alone, pattern alone, both; shorthand positions
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {
+            "t": {"allow": {"n": [{"type": "number"}],
+                            "s": {"type": "string", "pattern": "^[a-z]+$"},
+                            "any": [{"pattern": "^x$"}]},
+                  "deny": [{"type": "string", "pattern": "evil"}]}}})
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"n": 1.5, "s": "abc", "any": "x"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"n": "1"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"s": 5})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"s": "ABC"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"s": "evil"})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"any": "x"})[0])
+        # malformed typed rules fail closed at load
+        for bad in ({"type": "integer"}, {"type": "number", "regex": "x"}, {},
+                    {"type": "number", "pattern": 5}, 7):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                jail_mod.compile_policy({"arg_rules": {"t": {"allow": {"n": [bad]}}}})
+
+
+class TestToolNameNormalisation(ProxyCase):
+    """R4-7: deny_tools was an exact string match; `Delete_All`,
+    `delete_all ` and `delete_all\\u200b` walked past it."""
+
+    VARIANTS = ("Delete_All", "delete_all ", "delete_all\u200b", "\ufeffdelete_all",
+                "\uff44elete_all", "delete_al\u006c", "DELETE_ALL\t")
+
+    def test_deny_tools_matches_normalised_names(self):
+        pol = {"allow_tools": ["*"], "deny_tools": ["delete_all"]}
+        for name in self.VARIANTS:
+            ok, reason = jail_mod.tool_allowed(pol, name, {})
+            self.assertFalse(ok, repr(name))
+            self.assertIn("denied", reason)
+        self.assertTrue(jail_mod.tool_allowed(pol, "delete_some", {})[0])
+        self.assertEqual(jail_mod.normalize_tool_name(" Delete_All\u200b "), "delete_all")
+        # an allow list is matched the same way, and arg_rules follow the
+        # normalised name: a Path-cased call cannot shed its rules
+        pol = compiled({"allow_tools": ["read_file"], "arg_rules": {
+            "read_file": {"deny": {"path": ["^/etc/"]}}}})
+        self.assertTrue(jail_mod.tool_allowed(pol, "Read_File", {"path": "/tmp/a"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "Read_File", {"path": "/etc/pw"})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "read_files", {})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "\u200b", {})[0])
+        with self.assertRaises(ValueError):
+            jail_mod.compile_policy({"arg_rules": {"read_file": {}, "Read_File": {}}})
+
+    def test_proxy_denies_and_hides_variants(self):
+        pol = write_policy(self.tmp, {"allow_tools": ["*"],
+                                      "deny_tools": ["delete_all"],
+                                      "arg_rules": {}, "hide_denied": True})
+        resps = drive_jail(pol, self.server, [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
+            call(2, "Delete_All", {}),
+            call(3, "delete_all\u200b", {}),
+            call(4, "read_file", {})])
+        by_id = {r["id"]: r for r in resps}
+        self.assertNotIn("delete_all", [t["name"] for t in by_id[1]["result"]["tools"]])
+        self.assertIn("denied", by_id[2]["error"]["message"])
+        self.assertIn("denied", by_id[3]["error"]["message"])
+        self.assertIn("result", by_id[4])
+        # hide_denied also drops a listed variant spelling
+        self.assertEqual(jail_mod.filter_tools_list(
+            {"deny_tools": ["delete_all"]}, r := {"tools": [{"name": "Delete_All"}, {"name": "ok"}]}), None)
+        self.assertEqual([t["name"] for t in r["tools"]], ["ok"])
+
+
+class TestMethodScope(ProxyCase):
+    """R4-8: only tools/call was policed. deny_methods refuses whole
+    JSON-RPC methods; policed_methods runs more methods through the tool
+    policy (prompts/get by name, resources/read by uri)."""
+
+    def test_deny_methods(self):
+        pol = write_policy(self.tmp, {"allow_tools": ["*"], "deny_tools": [],
+                                      "arg_rules": {}, "hide_denied": False,
+                                      "deny_methods": ["resources/*", "prompts/get"]})
+        resps = drive_jail(pol, self.server, [
+            {"jsonrpc": "2.0", "id": 1, "method": "resources/read",
+             "params": {"uri": "file:///etc/passwd"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "prompts/get", "params": {"name": "p"}},
+            {"jsonrpc": "2.0", "method": "resources/subscribe", "params": {"uri": "x"}},
+            {"jsonrpc": "2.0", "id": 3, "method": "prompts/list"},
+            call(4, "read_file", {}),
+        ])
+        by_id = {r["id"]: r for r in resps}
+        self.assertEqual(set(by_id), {1, 2, 3, 4})
+        for rid in (1, 2):
+            self.assertEqual(by_id[rid]["error"]["code"], -32601)
+            self.assertIn("denied by policy", by_id[rid]["error"]["message"])
+        self.assertIn("result", by_id[3])  # prompts/list is not prompts/get
+        self.assertIn("result", by_id[4])
+        with open(jail_mod.AUDIT_LOG, encoding="utf-8") as f:
+            entries = [json.loads(l) for l in f if l.strip()]
+        denied = [e for e in entries if e["decision"] == "deny"]
+        self.assertEqual([e.get("method") for e in denied],
+                         ["resources/read", "prompts/get", "resources/subscribe"])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            jail_mod.AUDIT_LOG = jail_mod.AUDIT_LOG  # (unchanged) --audit reads it
+            cli_mod.cmd_audit(argparse.Namespace(limit=50))
+        self.assertIn("DENY  method resources/read", buf.getvalue())
+
+    def test_policed_methods_run_through_the_tool_policy(self):
+        pol = write_policy(self.tmp, {
+            "allow_tools": ["read_file", "summarise", "file:///srv/data/a.txt"],
+            "deny_tools": [], "hide_denied": False,
+            "arg_rules": {"summarise": {"allow": {"lang": ["^en$"]}}},
+            "policed_methods": ["tools/call", "prompts/get", "resources/read"]})
+        resps = drive_jail(pol, self.server, [
+            {"jsonrpc": "2.0", "id": 1, "method": "prompts/get",
+             "params": {"name": "summarise", "arguments": {"lang": "en"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "prompts/get",
+             "params": {"name": "summarise", "arguments": {"lang": "en; rm -rf /"}}},
+            {"jsonrpc": "2.0", "id": 3, "method": "prompts/get", "params": {"name": "other"}},
+            {"jsonrpc": "2.0", "id": 4, "method": "resources/read",
+             "params": {"uri": "file:///srv/data/a.txt"}},
+            {"jsonrpc": "2.0", "id": 5, "method": "resources/read",
+             "params": {"uri": "file:///etc/passwd"}},
+            {"jsonrpc": "2.0", "id": 6, "method": "completion/complete",
+             "params": {"ref": {"name": "anything"}}},  # not policed: passes
+        ])
+        by_id = {r["id"]: r for r in resps}
+        self.assertEqual(set(by_id), {1, 2, 3, 4, 5, 6})
+        self.assertIn("result", by_id[1])
+        self.assertIn("denied", by_id[2]["error"]["message"])
+        self.assertIn("not in allow_tools", by_id[3]["error"]["message"])
+        self.assertIn("result", by_id[4])
+        self.assertIn("file:///etc/passwd", by_id[5]["error"]["message"])
+        self.assertIn("result", by_id[6])
+        with open(jail_mod.AUDIT_LOG, encoding="utf-8") as f:
+            entries = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(entries[1]["method"], "prompts/get")
+        self.assertEqual(entries[1]["tool"], "summarise")
+
+    def test_scope_defaults_and_validation(self):
+        pol = jail_mod.default_policy()
+        self.assertEqual(pol["policed_methods"], ["tools/call"])
+        self.assertEqual(pol["deny_methods"], [])
+        jail_mod.compile_policy(pol)
+        gen = jail_mod.generate_policy([], [("t", {})])
+        self.assertEqual(gen["policed_methods"], ["tools/call"])
+        # tools/call is policed even when policed_methods leaves it out
+        self.assertTrue(jail_mod.method_policed({"policed_methods": ["prompts/get"]}, "tools/call"))
+        self.assertFalse(jail_mod.method_policed({}, "prompts/get"))
+        self.assertTrue(jail_mod.method_denied({"deny_methods": ["resources/*"]}, "resources/read"))
+        self.assertFalse(jail_mod.method_denied({"deny_methods": ["resources/*"]}, "tools/call"))
+        for bad in ("resources/read", [1], [""]):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                jail_mod.compile_policy({"deny_methods": bad})
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                jail_mod.compile_policy({"policed_methods": bad})
+        # README states the scope
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        for word in ("policed_methods", "deny_methods", "resources/read", "prompts/get"):
+            self.assertIn(word, readme)
+
+
+class TestStrictArgsEmptyContainers(unittest.TestCase):
+    """R4-9: {"q": {}} and {"q": []} passed strict_args as "empty
+    arguments". An empty container is a value; only {} is empty."""
+
+    def test_empty_containers_are_values(self):
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {}, "strict_args": True})
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", None)[0])
+        for args in ({"q": {}}, {"q": []}, {"q": {"r": []}}, {"q": [{}]}):
+            ok, reason = jail_mod.tool_allowed(pol, "t", args)
+            self.assertFalse(ok, args)
+            self.assertIn("strict_args", reason)
+        # learned from a call that carried an empty container: that exact
+        # shape is accepted, a filled container at the same path is not
+        gen = jail_mod.generate_policy([], [("t", {"q": {}, "tags": []})])
+        self.assertEqual(sorted(gen["arg_rules"]["t"]["allow"]), ["q", "tags"])
+        pol = compiled(gen)
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"q": {}, "tags": []})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"q": {"a": 1}, "tags": []})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"q": {}, "tags": ["x"]})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"q": [], "tags": []})[0])
+        # deny rules see empty containers as text too
+        pol = compiled({"allow_tools": ["*"], "arg_rules": {"t": {"deny": {"opts": [r"^\{\}$"]}}}})
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"opts": {}})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"opts": {"a": 1}})[0])
+
+
+class TestBrokenPipe(unittest.TestCase):
+    """R4-10: `mcp-jail --audit | head` must not end in a traceback."""
+
+    def setUp(self):
+        self._old_audit = jail_mod.AUDIT_LOG
+        jail_mod.AUDIT_LOG = None
+
+    def tearDown(self):
+        jail_mod.AUDIT_LOG = self._old_audit
+
+    def test_broken_pipe_in_main_is_a_quiet_exit_0(self):
+        for i in range(5):
+            jail_mod.audit({"tool": f"t{i}", "decision": "deny", "reason": "r"})
+
+        class Broken(io.TextIOBase):
+            def write(self, s):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        err = io.StringIO()
+        with redirect_stdout(Broken()), redirect_stderr(err):
+            code = cli_mod.main(["--audit"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("Traceback", err.getvalue())
+
+    def test_reader_going_away_end_to_end(self):
+        for i in range(200):
+            jail_mod.audit({"tool": f"t{i}", "decision": "deny", "reason": "x" * 100})
+        env = dict(os.environ)
+        env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mcp_jail", "--audit", "--limit", "200"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
+        proc.stdout.close()  # the reader (`head`) is gone before we write
+        try:
+            _, err = proc.communicate(timeout=20)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertNotIn(b"Traceback", err)
+        self.assertNotIn(b"Exception ignored", err)
 
 
 if __name__ == "__main__":
