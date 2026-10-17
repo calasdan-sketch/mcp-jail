@@ -18,7 +18,7 @@ import sys
 
 from . import jail as jail_mod
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def _harden_streams() -> None:
@@ -39,7 +39,7 @@ def _harden_streams() -> None:
 
 
 def cmd_init_policy(args) -> int:
-    path = os.path.expanduser(args.path)
+    path = jail_mod.expand_path(args.path)
     if os.path.exists(path) and not args.force:
         print(f"exists: {path} (use --force to overwrite)", file=sys.stderr)
         return 2
@@ -75,10 +75,13 @@ def cmd_audit(args) -> int:
 def cmd_learn(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="mcp-jail learn",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Observe a server session and generate a tight-fit "
-                    "allowlist policy. --script drives canned calls against "
-                    "the server (no client needed); without it, learn "
-                    "proxies stdin/stdout until stdin EOF or Ctrl-C.")
+                    "allowlist policy: only the tools actually called, with "
+                    "per-argument allow patterns derived from the values "
+                    "seen.\n\n--script drives canned calls against the "
+                    "server (no client needed); without it, learn proxies "
+                    "stdin/stdout until stdin EOF or Ctrl-C.")
     p.add_argument("--script",
                    help="JSON array of {\"tool\": name, "
                         "\"arguments\": {...}} to drive against the server")
@@ -104,21 +107,34 @@ def cmd_learn(argv: list[str]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     default_policy = jail_mod.default_policy_path()
-    p = argparse.ArgumentParser(prog="mcp-jail", description=__doc__)
+    p = argparse.ArgumentParser(
+        prog="mcp-jail", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="subcommand: mcp-jail learn --help")
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    p.add_argument("--policy", default=default_policy,
-                   help=f"policy file (default: {default_policy})")
-    p.add_argument("--init-policy", action="store_true")
-    p.add_argument("--path", default=default_policy,
-                   help="where --init-policy writes")
-    p.add_argument("--force", action="store_true")
-    p.add_argument("--audit", action="store_true")
-    p.add_argument("--limit", type=int, default=50)
-    p.add_argument("--timeout", type=float, default=30.0,
+    p.add_argument("--policy", default=default_policy, metavar="FILE",
+                   help=f"policy file; ~ and environment variables are "
+                        f"expanded (default: {default_policy})")
+    p.add_argument("--init-policy", action="store_true",
+                   help="write an annotated starter policy to --path and "
+                        "exit (allows every tool: edit it)")
+    p.add_argument("--path", default=default_policy, metavar="FILE",
+                   help=f"where --init-policy writes "
+                        f"(default: {default_policy})")
+    p.add_argument("--force", action="store_true",
+                   help="let --init-policy overwrite an existing file")
+    p.add_argument("--audit", action="store_true",
+                   help="print the last --limit audit-log entries "
+                        "(allow/deny per tool call) and exit")
+    p.add_argument("--limit", type=int, default=50, metavar="N",
+                   help="how many audit entries --audit shows "
+                        "(default: 50)")
+    p.add_argument("--timeout", type=float, default=30.0, metavar="SECS",
                    help="seconds to wait for each server response "
                         "(default: 30)")
     p.add_argument("server", nargs=argparse.REMAINDER,
-                   help="server command after -- : mcp-jail --policy p.json -- npx -y srv")
+                   help="server command after -- : "
+                        "mcp-jail --policy p.json -- npx -y srv")
     return p
 
 
