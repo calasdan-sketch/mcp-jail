@@ -18,7 +18,24 @@ import sys
 
 from . import jail as jail_mod
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+
+
+def _harden_streams() -> None:
+    """Never crash on a console that cannot encode a tool name or reason.
+
+    The proxy itself writes protocol bytes (UTF-8) straight to the binary
+    stdout; this only affects the human-facing text output (--audit,
+    learn summaries, errors) on e.g. a cp1252 Windows console.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None or getattr(stream, "errors", None) != "strict":
+            continue
+        try:
+            reconfigure(errors="replace")
+        except (OSError, ValueError):
+            pass
 
 
 def cmd_init_policy(args) -> int:
@@ -26,20 +43,21 @@ def cmd_init_policy(args) -> int:
     if os.path.exists(path) and not args.force:
         print(f"exists: {path} (use --force to overwrite)", file=sys.stderr)
         return 2
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(jail_mod.default_policy(), f, indent=2)
+        f.write("\n")
     print(f"wrote {path}")
     return 0
 
 
 def cmd_audit(args) -> int:
-    path = jail_mod.AUDIT_LOG
+    path = jail_mod.audit_log_path()
     if not os.path.exists(path):
         print("no audit log yet.")
         return 0
     denies = 0
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         lines = f.readlines()[-args.limit:]
     for ln in lines:
         try:
@@ -85,11 +103,14 @@ def cmd_learn(argv: list[str]) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    default_policy = jail_mod.default_policy_path()
     p = argparse.ArgumentParser(prog="mcp-jail", description=__doc__)
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
-    p.add_argument("--policy", default=jail_mod.DEFAULT_POLICY_PATH)
+    p.add_argument("--policy", default=default_policy,
+                   help=f"policy file (default: {default_policy})")
     p.add_argument("--init-policy", action="store_true")
-    p.add_argument("--path", default=jail_mod.DEFAULT_POLICY_PATH)
+    p.add_argument("--path", default=default_policy,
+                   help="where --init-policy writes")
     p.add_argument("--force", action="store_true")
     p.add_argument("--audit", action="store_true")
     p.add_argument("--limit", type=int, default=50)
@@ -102,6 +123,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+    _harden_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv[:1] == ["learn"]:
         return cmd_learn(argv[1:])
