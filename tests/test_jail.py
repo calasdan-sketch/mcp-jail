@@ -5345,6 +5345,17 @@ def pid_running(pid: int) -> bool:
         return True
 
 
+def _default_signals():
+    """Runs in the child before exec (POSIX): Ctrl-C, SIGQUIT, SIGHUP and
+    SIGTERM act as they do for a program started from a terminal. A test
+    runner that was itself started as a background job (`cmd &`) or under
+    nohup hands "ignored" down for some of them, and a Python that inherits
+    SIGINT ignored never turns Ctrl-C into KeyboardInterrupt: the test would
+    wait for a signal that nothing reacts to."""
+    for name in ("SIGINT", "SIGQUIT", "SIGHUP", "SIGTERM"):
+        signal.signal(getattr(signal, name), signal.SIG_DFL)
+
+
 class RealJail:
     """mcp-jail as a program of its own (so that it can be sent signals),
     wrapping FAKE_SIGNALLED. Its output goes to files: nothing to fill up."""
@@ -5363,7 +5374,8 @@ class RealJail:
         self.proc = subprocess.Popen(
             [sys.executable, "-m", "mcp_jail"] + cmd + list(args) + ["--"] + server,
             stdin=subprocess.PIPE, stdout=self._out, stderr=self._err,
-            env=child_env())
+            env=child_env(),
+            preexec_fn=_default_signals if os.name == "posix" else None)
         case.addCleanup(self.cleanup)
 
     def wait_started(self, limit=15.0) -> int:
@@ -5636,6 +5648,13 @@ class TestStopSignalsInTheLoop(ProxyCase):
     @unittest.skipUnless(hasattr(signal, "SIGTERM"), "signals")
     def test_the_handlers_are_taken_for_the_session_and_given_back(self):
         pol = write_policy(self.tmp, ALLOW_ALL)
+        if threading.current_thread() is threading.main_thread():
+            # start from the defaults, whatever the runner has: nohup (or a
+            # background job) hands SIGHUP down as "ignored", and an ignored
+            # signal is left alone (the next test)
+            for s in jail_mod._stop_signals():
+                self.addCleanup(signal.signal, s, signal.getsignal(s))
+                signal.signal(s, signal.SIG_DFL)
         before = {s: signal.getsignal(s) for s in jail_mod._stop_signals()}
         seen = {}
         real = jail_mod._Proxy.serve
