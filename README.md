@@ -27,8 +27,10 @@ Zero client changes: swap the server command for the jail wrapper.
 `~` and environment variables in `--policy` are expanded by mcp-jail
 itself (the client passes these arguments straight from its JSON config,
 no shell in between). The server command is looked up on `PATH` the way
-the OS does — on Windows `npx` resolves to `npx.cmd` — and a command
-that is not there is a clean `exit 2`, not a traceback.
+the OS does — on Windows `npx` resolves to `npx.cmd` — and a command that
+cannot be run is a clean `exit 2`, not a traceback: not on `PATH`, a
+directory, a file without the execute permission, or one the system will
+not start (a script with no `#!` line).
 
 ## Install
 
@@ -43,6 +45,8 @@ mcp-jail --version
 
 ```bash
 mcp-jail --init-policy                       # annotated starter policy
+mcp-jail --init-policy --path my.json        # ... written there, not to ~/.mcp-jail/policy.json
+mcp-jail --init-policy --force               # ... over a file that is already there
 mcp-jail --policy policy.json -- npx -y some-mcp-server
 mcp-jail --policy policy.json --timeout 10 -- npx -y some-mcp-server
 mcp-jail --policy policy.json --grace 10 -- npx -y some-mcp-server
@@ -50,6 +54,12 @@ mcp-jail --audit                             # who got denied lately
 mcp-jail learn --script calls.json --out policy.json -- npx -y some-mcp-server
 mcp-jail --help                              # every flag, explained
 ```
+
+`--init-policy` writes `~/.mcp-jail/policy.json`
+(`%USERPROFILE%\.mcp-jail\policy.json` on Windows), creating the
+directory; `--path FILE` writes it there instead. It refuses to replace a
+file that is already there (one line on stderr, exit `2`) unless you add
+`--force`.
 
 Policy (`policy.json`):
 
@@ -76,8 +86,10 @@ unambiguously is refused (exit `2`, the server is never started): an
 entry, which takes only `allow` and `deny` — with a suggestion
 (`unknown key 'alow_tools' (did you mean 'allow_tools'?)`); a
 **duplicate key** (a JSON reader keeps only the last one, so a second
-`deny_tools` would silently replace the first); a tool list that holds
-anything but non-empty strings; a bad regex. `_comment` (and
+`deny_tools` would silently replace the first); a tool list that is
+anything but a list of non-empty strings (an object there would keep
+only its keys and drop the rules nested in it: argument rules go under
+`arg_rules`); a bad regex. `_comment` (and
 `_not_called`, which `learn` writes) are notes and are never read.
 Leaving `allow_tools` out is allowed and means "every tool that
 `deny_tools` does not name"; write `"allow_tools": []` to allow nothing.
@@ -91,7 +103,8 @@ A policy path that is a directory, or cannot be read, is the same exit
   `deny_tools` refuses such an entry when the policy loads (exit `2`)
   instead of letting it deny nothing, an `arg_rules` key or a
   `policed_methods` entry with a `*` in it is refused the same way, and
-  an `allow_tools` entry like that simply matches no tool.
+  an `allow_tools` entry like that matches only a tool whose name really
+  has the `*` in it.
   (`deny_methods`, below, is the list that takes globs.)
   Names are compared **normalised** — Unicode NFKC, case-folded,
   trimmed, invisible characters (zero-width space, soft hyphen, BOM,
@@ -196,27 +209,33 @@ writes the policy; `learn --script` drives the server from a single thread
 and does not catch them.
 
 `mcp-jail --audit` shows the last 50 records, or the last N with
-`--limit N` (a whole number, 1 or more: anything else is exit `2`). It
-shows every field of a record as printable text on one line: a newline,
-a terminal escape sequence or a bidi override in a reason or a tool name
-(the client chooses it) is shown as an escape (`\n`, `\x1b`, `\u202e`),
-so it cannot forge a line of the report or drive your terminal.
+`--limit N` (a whole number, 1 or more: anything else is exit `2`). Each
+record is one line of printable text: `allow` or `DENY`, the tool (or the
+method, or `client message` / `server message` for a message the jail
+would not relay) and the reason; the arguments and the time are in the
+file, not in this report. A newline, a terminal escape sequence or a bidi
+override in a reason or a tool name (the client chooses it) is shown as
+an escape (`\n`, `\x1b`, `\u202e`), so it cannot forge a line of the
+report or drive your terminal.
 
 ## Exit codes
 
 | code | meaning |
 |------|---------|
 | `0`  | a clean session: the client finished and every request it sent was answered (a denied call is the jail doing its job, not a failure); or `--audit` / `--init-policy` / `learn` succeeded |
-| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not on `PATH`, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early |
+| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not found or not executable, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early |
 | `3`  | the server failed while the jail was relaying: it exited or closed its pipes while the client was still talking to it, stopped reading its input, or left a request unanswered past `--timeout` |
 | `143`, `129` | mcp-jail was told to stop by SIGTERM or SIGHUP and wound the session down first (128 plus the signal number; see *Signals* above) |
 
 A wrapper (a CI job, a supervisor) can rely on the exit status for what
 happened to the requests the client made, and on a line on stderr that
-says why it is `3`. A client that sends nothing is asking nothing of the
-server, so that session is `0` whatever became of the server; to check
-that a server starts, send it `initialize`: a server that has died by
-then is `3`.
+says why it is `3`. With standard error closed (`2>&-`; `pythonw` on
+Windows) there is nowhere for that line to go: it is dropped, never
+written to standard output (which carries the protocol, or the policy
+`learn` writes), and the exit status is the same. A client that sends
+nothing is asking nothing of the server, so that session is `0` whatever
+became of the server; to check that a server starts, send it
+`initialize`: a server that has died by then is `3`.
 
 ## Argument paths
 
@@ -277,7 +296,7 @@ denied too.
 
 ## Policy authoring
 
-Policies are JSON. `allow_tools` / `deny_tools` are tool names
+Policies are JSON. `allow_tools` / `deny_tools` are lists of tool names
 (a lone `*` = all, deny wins). `arg_rules` map argument paths to regexes, as
 above.
 
@@ -381,6 +400,15 @@ Every value in a call must match a rule for its path — an unseen
 argument, or a seen one with an unseen shape or type, is denied. A call
 the server answered with an error (or an MCP `isError` result) is not
 learned; neither is a call whose `arguments` is not an object.
+
+A tool that cannot be written into a policy is left out, so denied, with
+a line on stderr and a note in the file's `_comment`: a name with a `*`
+in it (a policy takes `*` only on its own, as every tool, and an
+`arg_rules` key names one tool), and names that are one name once
+normalised (`Read` and `read`: the jail compares names ignoring case, so
+a policy could not tell them apart). `learn` used to write those into a
+policy that mcp-jail then refused to load. The summary counts them
+(`allowlisted the 2 called (1 left out)`).
 
 The policy goes to stdout or `--out`; a short summary (tools listed,
 tools called, successful calls, the server's MCP revision) goes to
@@ -517,6 +545,11 @@ patterns and on `learn` above apply as well):
   killed or left on its own: the pipe cannot be closed under the thread
   that is reading it, so mcp-jail exits when that grandchild lets go or
   ends.
+- **`learn` writes an argument name as a path.** A name with a `.` in it
+  is read as nesting (`a.b` becomes `b` inside `a`, so the call it was
+  learned from is denied, and `a..b` or `.a` make mcp-jail refuse the
+  file at start-up), and `*` or `**` as a wildcard. Read the generated
+  file when a tool takes an argument named like that.
 - **Numbers are re-written as an IEEE double would write them.** Integers
   of up to 4300 digits are exact (a longer one is refused, as above); a
   decimal with more significant digits than a double holds (about 17) is

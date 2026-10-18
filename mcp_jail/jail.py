@@ -119,9 +119,20 @@ def _missing_streams(client_in, client_out) -> "str | None":
 
 
 def _say(line: str) -> None:
-    """One line on stderr; a process without one has nothing to say it on."""
-    if sys.stderr is not None:
-        sys.stderr.write(line + "\n")
+    """One line on stderr. A process without one (started with it closed:
+    `2>&-`, or pythonw; sys.stderr is None) has nothing to say it on, and
+    print(file=None) would say it on standard OUTPUT, which carries the
+    protocol (and the policy `learn` writes); one whose stderr cannot be
+    written to (its reader went away) is no worse off. Neither is an error:
+    a notice must not end a session, or turn exit status 2 into 1."""
+    err = sys.stderr
+    if err is None:
+        return
+    try:
+        err.write(line + "\n")
+    except (OSError, ValueError):
+        pass
+
 
 # ---------------------------------------------------------------------------
 # paths
@@ -538,7 +549,15 @@ def compile_policy(pol: dict) -> dict:
     pol["_rules_by_norm"] = by_norm
     for key in ("allow_tools", "deny_tools"):
         val = pol.get(key)
-        if val is not None and not isinstance(val, (list, tuple, set, dict)):
+        if isinstance(val, dict):
+            # iterating one gives its keys alone: whatever is nested under a
+            # name (a path pattern meant as an argument rule) would be dropped
+            # and the tool allowed without it
+            raise ValueError(f"{key} must be a list of tool names, not an "
+                             f"object (only its keys would count and what is "
+                             f"nested in it would be dropped; argument rules "
+                             f"go under arg_rules.<tool>.allow / .deny)")
+        if val is not None and not isinstance(val, (list, tuple)):
             raise ValueError(f"{key} must be a list of tool names")
         for entry in (val or ()):
             # a nested list or a number would be skipped by every match
@@ -890,11 +909,7 @@ def audit(event: dict) -> None:
         with _open_private_append(path) as f:
             f.write(json.dumps(event) + "\n")
     except OSError as e:
-        try:
-            print(f"mcp-jail: cannot write audit log {path}: {e}",
-                  file=sys.stderr)
-        except (OSError, ValueError):
-            pass
+        _say(f"mcp-jail: cannot write audit log {path}: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1229,7 +1244,20 @@ class _Reader(threading.Thread):
 
 
 class ServerNotFound(Exception):
-    """The server command is not on PATH (or not executable)."""
+    """The server command cannot be run. str() is the command. With no `why`
+    the lookup found nothing to run: it is not on PATH, or it is a directory,
+    or a file without the execute permission (shutil.which says None to all
+    three). With one, it is what the system answered when it was started."""
+
+    def __init__(self, command: str, why: "str | None" = None):
+        super().__init__(command)
+        self.why = why
+
+
+def _server_problem(e: ServerNotFound) -> str:
+    if e.why:
+        return f"cannot start the server command {e}: {e.why}"
+    return f"server command not found or not executable: {e}"
 
 
 def _spawn(server_cmd: list[str]):
@@ -1246,9 +1274,12 @@ def _spawn(server_cmd: list[str]):
         err.fileno()
     except (io.UnsupportedOperation, AttributeError, OSError, ValueError):
         err = None
-    proc = subprocess.Popen(
-        [exe] + list(server_cmd[1:]), stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE, stderr=err)
+    try:
+        proc = subprocess.Popen(
+            [exe] + list(server_cmd[1:]), stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, stderr=err)
+    except OSError as e:    # no #! line (Exec format error), permission, ...
+        raise ServerNotFound(server_cmd[0], e.strerror or str(e)) from None
     assert proc.stdin and proc.stdout
     return proc
 
@@ -1628,10 +1659,7 @@ class _Proxy:
     # -- helpers ----------------------------------------------------------
 
     def _log(self, msg: str) -> None:
-        try:
-            print(f"mcp-jail: {msg}", file=sys.stderr)
-        except (OSError, ValueError):
-            pass
+        _say(f"mcp-jail: {msg}")
 
     def _deadline(self) -> float | None:
         return (time.monotonic() + self.timeout) if self.timeout else None
@@ -2143,24 +2171,23 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
     if problem:
-        sys.stderr.write(f"mcp-jail: {problem}\n")
+        _say(f"mcp-jail: {problem}")
         return 2
     policy_path = expand_path(policy_path)
     try:
         pol = load_policy(policy_path)
     except FileNotFoundError:
-        sys.stderr.write(f"mcp-jail: no policy at {policy_path}\n"
-                         f"mcp-jail: create one - see README\n")
+        _say(f"mcp-jail: no policy at {policy_path}\n"
+             f"mcp-jail: create one - see README")
         return 2
     except OSError as e:        # a directory, no permission, ...
-        sys.stderr.write(f"mcp-jail: cannot read the policy "
-                         f"{policy_path}: {e}\n")
+        _say(f"mcp-jail: cannot read the policy {policy_path}: {e}")
         return 2
     except RecursionError:
-        sys.stderr.write("mcp-jail: bad policy: nested too deeply\n")
+        _say("mcp-jail: bad policy: nested too deeply")
         return 2
     except (json.JSONDecodeError, re.error, ValueError) as e:
-        sys.stderr.write(f"mcp-jail: bad policy: {e}\n")
+        _say(f"mcp-jail: bad policy: {e}")
         return 2
     client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
     closed = _missing_streams(client_in, client_out)
@@ -2171,8 +2198,7 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
         try:
             proc = _spawn(server_cmd)
         except ServerNotFound as e:
-            sys.stderr.write(f"mcp-jail: server command not found: {e} "
-                             f"(not on PATH)\n")
+            _say(f"mcp-jail: {_server_problem(e)}")
             return 2
         try:
             return _Proxy(proc, client_in, client_out, timeout, pol,
@@ -2267,6 +2293,28 @@ def _observed_paths(args) -> list[tuple[str, object]]:
     return out
 
 
+def _unlearnable(called) -> dict[str, str]:
+    """The called tool names that a policy cannot hold, each with why: a name
+    with a `*` in it (arg_rules keys name one tool each, and `*` alone in
+    allow_tools is every tool), and names that are one name once normalised
+    (Read and read: the policy compares names that way, so it could not tell
+    them apart). The loader refuses a policy that has either."""
+    names = sorted(set(called))
+    by_norm: dict[str, list[str]] = {}
+    for name in names:
+        by_norm.setdefault(normalize_tool_name(name), []).append(name)
+    why: dict[str, str] = {}
+    for name in names:
+        norm = normalize_tool_name(name)
+        if "*" in norm:
+            why[name] = "a policy cannot hold a '*' in a tool name"
+        elif len(by_norm[norm]) > 1:
+            twins = ", ".join(repr(n) for n in by_norm[norm] if n != name)
+            why[name] = (f"it is the same tool name as {twins} once "
+                         f"normalised, and a policy cannot tell them apart")
+    return why
+
+
 def generate_policy(observed_tools: list[str],
                     observed_calls: list[tuple[str, dict]]) -> dict:
     """Build the tightest-fit allowlist policy from observations.
@@ -2275,13 +2323,17 @@ def generate_policy(observed_tools: list[str],
     tools the server merely listed are reported under `_not_called` for
     the reviewer, and denied. Every allowed tool gets an arg_rules entry,
     so with strict_args a tool that was only ever called with empty
-    arguments accepts only empty arguments.
+    arguments accepts only empty arguments. A called tool whose name a
+    policy cannot hold (see _unlearnable) is left out, so denied, and named
+    in the `_comment`: the loader would refuse the policy otherwise.
     """
     called = sorted({t for t, _ in observed_calls if isinstance(t, str)})
+    left_out = _unlearnable(called)
+    called = [t for t in called if t not in left_out]
     listed = {t for t in observed_tools if isinstance(t, str)}
     by_path: dict[tuple[str, str], list] = {}
     for tool, args in observed_calls:
-        if not isinstance(tool, str):
+        if not isinstance(tool, str) or tool in left_out:
             continue
         try:
             paths = _observed_paths(args)
@@ -2305,7 +2357,12 @@ def generate_policy(observed_tools: list[str],
                     "Only tools/call is checked (policed_methods).",
         "allow_tools": called,
     }
-    not_called = sorted(listed - set(called))
+    if left_out:
+        policy["_comment"] += (" Left out, so denied, because a policy "
+                               "cannot hold them: " + "; ".join(
+                                   f"{name!r} ({why})"
+                                   for name, why in left_out.items()) + ".")
+    not_called = sorted(listed - set(called) - set(left_out))
     if not_called:
         policy["_not_called"] = not_called  # listed by the server, denied
     policy.update({
@@ -2406,8 +2463,8 @@ class _Session:
                 return ("closed",)
             obj, code, _err = _parse(line)
             if code is not None:
-                print(f"learn: ignoring non-JSON line from server: "
-                      f"{_preview(line)}", file=sys.stderr)
+                _say(f"learn: ignoring non-JSON line from server: "
+                     f"{_preview(line)}")
                 continue
             if not isinstance(obj, dict):
                 continue
@@ -2478,9 +2535,8 @@ def _drive_script(session: _Session, calls: list[dict], timeout: float,
     if isinstance(version, str):
         rec.protocol_version = version
         if version != PROTOCOL_VERSION:
-            print(f"learn: server speaks MCP {version} (offered "
-                  f"{PROTOCOL_VERSION}); continuing with the server's version",
-                  file=sys.stderr)
+            _say(f"learn: server speaks MCP {version} (offered "
+                 f"{PROTOCOL_VERSION}); continuing with the server's version")
     # MCP: the client confirms the handshake before any other request;
     # an SDK server answers everything else with -32602 until it does.
     if not session.notify({"jsonrpc": "2.0",
@@ -2491,7 +2547,7 @@ def _drive_script(session: _Session, calls: list[dict], timeout: float,
     if status[0] == "ok":
         rec.on_tools(status[1].get("result"))
     elif status[0] == "timeout":
-        print("learn: tools/list timed out", file=sys.stderr)
+        _say("learn: tools/list timed out")
     else:
         return "server closed before answering tools/list"
 
@@ -2507,11 +2563,10 @@ def _drive_script(session: _Session, calls: list[dict], timeout: float,
             if _call_succeeded(status[1]):
                 rec.on_call(name, args)
             else:
-                print(f"learn: call {i} ({name!r}) failed on the server; "
-                      f"not learned", file=sys.stderr)
+                _say(f"learn: call {i} ({name!r}) failed on the server; "
+                     f"not learned")
         elif status[0] == "timeout":
-            print(f"learn: call {i} ({name!r}) timed out "
-                  f"after {timeout}s", file=sys.stderr)
+            _say(f"learn: call {i} ({name!r}) timed out after {timeout}s")
         else:
             return (f"server closed during call {i} ({name!r}); "
                     f"{len(calls) - i} call(s) not driven")
@@ -2529,37 +2584,35 @@ def learn(server_cmd: list[str], script: str | None = None,
     goes to stderr.
 
     Exit 2 without touching --out when the script or --out is unusable,
-    the server command is missing, or the session ended early (refused
+    the server command cannot be run, or the session ended early (refused
     handshake, server gone): whatever was learned by then goes to stdout
     for review instead, so a failed run never overwrites a good policy.
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
     if problem:
-        print(f"mcp-jail learn: {problem}", file=sys.stderr)
+        _say(f"mcp-jail learn: {problem}")
         return 2
     calls: list[dict] = []
     if script is not None:
         script = expand_path(script)
         if not os.path.exists(script):
-            print(f"mcp-jail learn: no script at {script}", file=sys.stderr)
+            _say(f"mcp-jail learn: no script at {script}")
             return 2
         try:
             calls = load_script(script)
         except (OSError, ValueError) as e:
-            print(f"mcp-jail learn: bad --script {script}: {e}",
-                  file=sys.stderr)
+            _say(f"mcp-jail learn: bad --script {script}: {e}")
             return 2
     if out:
         out = expand_path(out)
         if os.path.isdir(out):
-            print(f"mcp-jail learn: --out {out} is a directory",
-                  file=sys.stderr)
+            _say(f"mcp-jail learn: --out {out} is a directory")
             return 2
         try:
             os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
         except OSError as e:
-            print(f"mcp-jail learn: cannot create the directory for "
-                  f"--out {out}: {e}", file=sys.stderr)
+            _say(f"mcp-jail learn: cannot create the directory for "
+                 f"--out {out}: {e}")
             return 2
     client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
     if script is None:
@@ -2579,8 +2632,7 @@ def learn(server_cmd: list[str], script: str | None = None,
         try:
             proc = _spawn(server_cmd)
         except ServerNotFound as e:
-            print(f"mcp-jail learn: server command not found: {e} "
-                  f"(not on PATH)", file=sys.stderr)
+            _say(f"mcp-jail learn: {_server_problem(e)}")
             return 2
         failure: str | None = None
         try:
@@ -2598,36 +2650,40 @@ def learn(server_cmd: list[str], script: str | None = None,
         finally:
             _stop(proc)
     policy = generate_policy(rec.tools, rec.calls)
+    for name, why in _unlearnable(
+            t for t, _ in rec.calls if isinstance(t, str)).items():
+        _say(f"learn: left {name!r} out of the policy ({why}); "
+             f"it stays denied")
     text = json.dumps(policy, indent=2)
     code = 0
     if failure:
         code = 2
-        print(f"learn: {failure}", file=sys.stderr)
+        _say(f"learn: {failure}")
         if rec.calls:
-            print("learn: partial policy follows on stdout (--out not "
-                  "written); review before use", file=sys.stderr)
+            _say("learn: partial policy follows on stdout (--out not "
+                 "written); review before use")
             print(text)
         else:
-            print("learn: nothing learned; no policy written",
-                  file=sys.stderr)
+            _say("learn: nothing learned; no policy written")
     elif out:
         try:
             with open(out, "w", encoding="utf-8") as f:
                 f.write(text + "\n")
-            print(f"learn: wrote {out}", file=sys.stderr)
+            _say(f"learn: wrote {out}")
         except OSError as e:
             code = 2
-            print(f"learn: cannot write {out}: {e}; policy follows on "
-                  f"stdout", file=sys.stderr)
+            _say(f"learn: cannot write {out}: {e}; policy follows on stdout")
             print(text)
     else:
         print(text)
     n_listed = len(set(rec.tools))
     n_called = len({t for t, _ in rec.calls})
+    n_left = n_called - len(policy["allow_tools"])
+    left = f" ({n_left} left out)" if n_left else ""
     spoke = (f" (server speaks MCP {rec.protocol_version})"
              if rec.protocol_version else "")
-    print(f"learn: {n_listed} tool(s) listed by the server, "
-          f"{n_called} tool(s) called in {len(rec.calls)} successful "
-          f"call(s); allowlisted the {n_called} called{spoke}",
-          file=sys.stderr)
+    _say(f"learn: {n_listed} tool(s) listed by the server, "
+         f"{n_called} tool(s) called in {len(rec.calls)} successful "
+         f"call(s); allowlisted the {len(policy['allow_tools'])} "
+         f"called{left}{spoke}")
     return code

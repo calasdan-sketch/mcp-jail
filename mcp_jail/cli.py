@@ -76,6 +76,18 @@ def _harden_streams() -> None:
             pass
 
 
+class _Parser(argparse.ArgumentParser):
+    """argparse with nowhere to complain. error() prints the usage with
+    print_usage(sys.stderr), and print_usage(None) means standard OUTPUT -
+    which is where a process started with stderr closed would put it. It
+    exits 2 without a word then."""
+
+    def error(self, message):
+        if sys.stderr is None:
+            self.exit(2)
+        super().error(message)
+
+
 def _seconds(text: str) -> float:
     """argparse type for --timeout: a finite number of seconds, 0 or more.
     float() alone takes "nan" and "inf" and a minus sign."""
@@ -107,7 +119,7 @@ def _positive_count(text: str) -> int:
 def cmd_init_policy(args) -> int:
     path = jail_mod.expand_path(args.path)
     if os.path.exists(path) and not args.force:
-        print(f"exists: {path} (use --force to overwrite)", file=sys.stderr)
+        jail_mod._say(f"exists: {path} (use --force to overwrite)")
         return 2
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -165,7 +177,7 @@ def cmd_audit(args) -> int:
 
 
 def cmd_learn(argv: list[str]) -> int:
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="mcp-jail learn",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description="Observe a server session and generate a tight-fit "
@@ -193,9 +205,9 @@ def cmd_learn(argv: list[str]) -> int:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        print("error: no server command: "
-              "mcp-jail learn [--script c.json] [--out p.json] -- <cmd>",
-              file=sys.stderr)
+        jail_mod._say("error: no server command: "
+                      "mcp-jail learn [--script c.json] [--out p.json] "
+                      "-- <cmd>")
         return 2
     return jail_mod.learn(cmd, script=args.script, out=args.out,
                           timeout=args.timeout, grace=args.grace)
@@ -203,7 +215,7 @@ def cmd_learn(argv: list[str]) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     default_policy = jail_mod.default_policy_path()
-    p = argparse.ArgumentParser(
+    p = _Parser(
         prog="mcp-jail", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="subcommand: mcp-jail learn --help\n\n"
@@ -259,8 +271,8 @@ def _main(argv: list[str]) -> int:
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
     if not cmd:
-        print("error: no server command: mcp-jail --policy p.json -- <cmd>",
-              file=sys.stderr)
+        jail_mod._say("error: no server command: "
+                      "mcp-jail --policy p.json -- <cmd>")
         return 2
     return jail_mod.run(args.policy, cmd, timeout=args.timeout,
                         grace=args.grace)

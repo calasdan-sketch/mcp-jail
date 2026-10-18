@@ -36,6 +36,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _ENV_VARS = ("HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA",
              "XDG_CONFIG_HOME", "XDG_DATA_HOME")
 _saved_env: dict = {}
+_base = ""        # one private directory for everything the tests make
 _fake_home = ""
 
 
@@ -54,8 +55,10 @@ def _rmtree(path: str) -> None:
 
 
 def setUpModule():
-    global _fake_home
-    _fake_home = tempfile.mkdtemp(prefix="mjh")
+    global _base, _fake_home
+    _base = tempfile.mkdtemp(prefix="mjtest")
+    _fake_home = os.path.join(_base, "home")
+    os.mkdir(_fake_home)
     for var in _ENV_VARS:
         _saved_env[var] = os.environ.get(var)
         os.environ[var] = _fake_home
@@ -70,11 +73,13 @@ def tearDownModule():
             os.environ.pop(var, None)
         else:
             os.environ[var] = old
-    _rmtree(_fake_home)
+    _rmtree(_base)        # the fake home and every mktemp() directory in it
 
 
 def mktemp() -> str:
-    return tempfile.mkdtemp(prefix="mj")
+    """A new directory inside the module's private one, which tearDownModule
+    removes: nothing is left in the system temp directory."""
+    return tempfile.mkdtemp(prefix="mj", dir=_base or None)
 
 
 def child_env() -> dict:
@@ -345,7 +350,7 @@ class TestPolicy(unittest.TestCase):
         self.assertIn("denied", reason)
 
     def test_allowlist(self):
-        pol = {"allow_tools": ["read_file"], "deny_tools": {},
+        pol = {"allow_tools": ["read_file"], "deny_tools": [],
                "arg_rules": {}}
         ok, _ = jail_mod.tool_allowed(pol, "read_file", {})
         self.assertTrue(ok)
@@ -1083,6 +1088,20 @@ class TestCLI(unittest.TestCase):
         self.assertEqual(cm.exception.code, 0)
         self.assertIn(cli_mod.VERSION, buf.getvalue())
 
+    def test_the_version_is_written_alike_in_both_places_and_was_raised(self):
+        # unlike the test above, on Python 3.10 too (no tomllib). Round 7
+        # changed what mcp-jail does (exit codes, messages, what learn
+        # writes), so the version is above the 0.6.1 it started from.
+        with open(os.path.join(REPO, "pyproject.toml"), encoding="utf-8") as f:
+            [in_pyproject] = re.findall(r'(?m)^version = "([^"]+)"$', f.read())
+        with open(os.path.join(REPO, "mcp_jail", "__init__.py"),
+                  encoding="utf-8") as f:
+            [in_package] = re.findall(r'(?m)^VERSION = "([^"]+)"$', f.read())
+        self.assertEqual(in_pyproject, in_package)
+        self.assertEqual(cli_mod.VERSION, in_package)
+        self.assertGreater(tuple(int(n) for n in in_package.split(".")),
+                           (0, 6, 1))
+
 
 # --------------------------------------------------------------------------
 # learn
@@ -1363,6 +1382,156 @@ class TestLearnAllowlist(ProxyCase):
         self.assertFalse(jail_mod.default_policy()["strict_args"])
         with self.assertRaises(ValueError):
             jail_mod.compile_policy({"strict_args": "yes"})
+
+
+class TestLearnedPolicyLoads(ProxyCase):
+    """R7 mcp-jail #3: `learn` wrote a policy its own loader refuses when a
+    called tool had a `*` in its name ("search*": `*` is not a tool name in
+    arg_rules, and a tool called "*" was written as allow_tools ["*"], every
+    tool) or when two called names were one name once normalised (Read and
+    read). The ones a policy cannot hold are left out - denied - and said so."""
+
+    STAR_NAMES = ("search*", "*", "\uff0a", "a*b", "*x", "x\u200b*")
+    TWINS = (["Read", "read"], ["READ_FILE", "read_file"],
+             ["rea\u200bd", "read"], ["\uff52\uff45\uff41\uff44", "read"],
+             ["a", "A", "\uff41"])
+
+    def test_a_tool_with_a_star_in_its_name_is_left_out(self):
+        for name in self.STAR_NAMES:
+            with self.subTest(name=name):
+                gen = jail_mod.generate_policy(
+                    [name, "read_file"],
+                    [(name, {"q": "x"}), ("read_file", {"path": "/a"})])
+                self.assertEqual(gen["allow_tools"], ["read_file"])
+                self.assertEqual(list(gen["arg_rules"]), ["read_file"])
+                pol = compiled(gen)                        # the loader takes it
+                for tool in (name, "something_else"):
+                    self.assertFalse(
+                        jail_mod.tool_allowed(pol, tool, {"q": "x"})[0], tool)
+                self.assertTrue(jail_mod.tool_allowed(
+                    pol, "read_file", {"path": "/a"})[0])
+
+    def test_names_that_are_one_name_once_normalised_are_all_left_out(self):
+        for twins in self.TWINS:
+            with self.subTest(twins=twins):
+                gen = jail_mod.generate_policy(
+                    twins + ["other"],
+                    [(t, {"p": "/a"}) for t in twins] + [("other", {})])
+                self.assertEqual(gen["allow_tools"], ["other"])
+                self.assertEqual(list(gen["arg_rules"]), ["other"])
+                pol = compiled(gen)
+                for tool in twins:
+                    self.assertFalse(
+                        jail_mod.tool_allowed(pol, tool, {"p": "/a"})[0], tool)
+                self.assertTrue(jail_mod.tool_allowed(pol, "other", {})[0])
+
+    def test_a_star_entry_in_allow_tools_names_one_tool_as_the_readme_says(self):
+        # not "matches no tool": it matches the tool whose name really has the
+        # `*` in it, and no other (hence learn cannot write it, and says so)
+        pol = compiled({"allow_tools": ["search*"]})
+        self.assertTrue(jail_mod.tool_allowed(pol, "search*", {})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "search_files", {})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "search", {})[0])
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        self.assertFalse("simply matches no tool" in flat, "the old sentence")
+        self.assertTrue("an `allow_tools` entry like that matches only a tool "
+                        "whose name really has the `*` in it" in flat)
+
+    def test_names_that_merely_look_alike_are_learned(self):
+        names = ["read_file", "read_files", "read-file", "Read2", "read2x"]
+        gen = jail_mod.generate_policy(names, [(n, {}) for n in names])
+        self.assertEqual(gen["allow_tools"], sorted(names))
+        compiled(gen)
+        # the star check is on the name: a `*` in an argument is not a name
+        gen = jail_mod.generate_policy(["t"], [("t", {"*": "x", "a*": "y"})])
+        self.assertEqual(gen["allow_tools"], ["t"])
+        compiled(gen)
+
+    def test_what_is_left_out_is_written_into_the_note(self):
+        gen = jail_mod.generate_policy(
+            ["search*", "Read", "read", "read_file", "unused"],
+            [("search*", {}), ("Read", {}), ("read", {}),
+             ("read_file", {"path": "/a"})])
+        self.assertEqual(gen["_not_called"], ["unused"])   # not called, as ever
+        for name in ("'search*'", "'Read'", "'read'"):
+            self.assertTrue(name in gen["_comment"], name)
+        self.assertTrue("denied" in gen["_comment"])
+        # a clean run keeps the note it always had
+        clean = jail_mod.generate_policy(["a"], [("a", {})])
+        self.assertFalse("Left out" in clean["_comment"])
+
+    def learn_calls(self, calls):
+        script = os.path.join(self.tmp, "calls.json")
+        with open(script, "w", encoding="utf-8") as f:
+            json.dump(calls, f)
+        err, out = io.StringIO(), io.StringIO()
+        with redirect_stderr(err), redirect_stdout(out):
+            code = jail_mod.learn([sys.executable, self.server],
+                                  script=script, timeout=10)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_learn_says_which_tools_it_left_out_and_the_policy_loads(self):
+        code, text, err = self.learn_calls([
+            {"tool": "search*", "arguments": {"q": "x"}},
+            {"tool": "Read"}, {"tool": "read"},
+            {"tool": "read_file", "arguments": {"path": "/a"}}])
+        self.assertEqual(code, 0, err)
+        policy = os.path.join(self.tmp, "learned.json")
+        with open(policy, "w", encoding="utf-8") as f:
+            f.write(text)
+        pol = jail_mod.load_policy(policy)               # no exit 2 at start-up
+        self.assertEqual(pol["allow_tools"], ["read_file"])
+        notices = [ln for ln in err.splitlines() if ln.startswith("learn: left ")]
+        self.assertEqual(sorted(n.split(" out of the policy")[0] for n in notices),
+                         ["learn: left 'Read'", "learn: left 'read'",
+                          "learn: left 'search*'"], err)
+        self.assertTrue(all("stays denied" in n for n in notices), notices)
+        self.assertIn("allowlisted the 1 called (3 left out)", err)
+        # and the file starts the jail
+        pol_path = write_policy(self.tmp, json.loads(text))
+        code, raw = drive_rc(pol_path, [sys.executable, self.server],
+                             [call(1, "read_file", {"path": "/a"}),
+                              call(2, "search*", {"q": "x"})], timeout=10)
+        self.assertEqual(code, 0)
+        replies = {json.loads(r)["id"]: json.loads(r) for r in raw}
+        self.assertIn("result", replies[1])
+        self.assertEqual(replies[2]["error"]["code"], -32602)
+
+    def test_a_clean_session_has_no_notice_and_the_old_summary(self):
+        code, text, err = self.learn_calls(
+            [{"tool": "read_file", "arguments": {"path": "/a"}}])
+        self.assertEqual(code, 0)
+        self.assertIn("allowlisted the 1 called", err)
+        self.assertNotIn("left out", err)
+
+    def test_argument_names_with_a_dot_are_the_documented_limitation(self):
+        # not fixed (README, Limitations): learn writes an argument name as a
+        # path, so `a.b` is read as `b` inside `a`
+        pol = compiled(jail_mod.generate_policy(["t"], [("t", {"a.b": "v"})]))
+        self.assertFalse(jail_mod.tool_allowed(pol, "t", {"a.b": "v"})[0])
+        self.assertTrue(jail_mod.tool_allowed(pol, "t", {"a": {"b": "v"}})[0])
+        for name in ("a..b", ".a", "a."):
+            gen = jail_mod.generate_policy(["t"], [("t", {name: "v"})])
+            with self.assertRaises(ValueError, msg=name):
+                compiled(gen)
+        # and `*` / `**` are wildcards in it: one key, or keys at any depth
+        star = compiled(jail_mod.generate_policy(["t"], [("t", {"*": "v"})]))
+        self.assertTrue(jail_mod.tool_allowed(star, "t", {"x": "v"})[0])
+        self.assertFalse(jail_mod.tool_allowed(star, "t", {"x": {"y": "v"}})[0])
+        deep = compiled(jail_mod.generate_policy(["t"], [("t", {"**": "v"})]))
+        self.assertTrue(jail_mod.tool_allowed(deep, "t", {"x": {"y": "v"}})[0])
+        self.assertFalse(jail_mod.tool_allowed(deep, "t", {"x": "w"})[0])
+
+    def test_the_readme_says_what_learn_leaves_out(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        for needle in ("A tool that cannot be written into a policy is left "
+                       "out, so denied",
+                       "a name with a `*` in it",
+                       "names that are one name once normalised",
+                       "**`learn` writes an argument name as a path.**"):
+            self.assertTrue(needle in flat, needle)
 
 
 class TestPolicyPath(unittest.TestCase):
@@ -1690,6 +1859,112 @@ class TestServerCommand(ProxyCase):
         self.assertIn(b"did:read_file", out[0])
 
 
+class TestServerCommandCannotRun(ProxyCase):
+    """R7 mcp-jail #5: a directory, or a file without the execute permission,
+    as the server command was reported as "not found ... (not on PATH)"; a
+    file that is executable but cannot be run (no #! line: "Exec format
+    error") was a traceback. The message says what the lookup found out - it
+    is not there or it cannot be run - and every such command is exit 2."""
+
+    NEEDLE = "server command not found or not executable: "
+
+    def refused(self, cmd, how="run"):
+        """(exit code, stderr) of starting `cmd` as the server."""
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+            if how == "run":
+                code = jail_mod.run(pol, cmd, stdin=io.BytesIO(b""),
+                                    stdout=io.BytesIO())
+            elif how == "learn":
+                code = jail_mod.learn(cmd, stdin=io.BytesIO(b""),
+                                      stdout=io.BytesIO())
+            else:
+                code = cli_mod.main(["--policy", pol, "--"] + cmd)
+        return code, err.getvalue()
+
+    def test_a_directory_is_not_called_a_missing_command(self):
+        adir = os.path.join(self.tmp, "adir")
+        os.mkdir(adir)
+        for how in ("run", "learn", "cli"):
+            with self.subTest(how=how):
+                code, err = self.refused([adir], how)
+                self.assertEqual(code, 2)
+                self.assertIn(self.NEEDLE + adir, err)
+                self.assertNotIn("PATH", err)
+                self.assertNotIn("Traceback", err)
+
+    @unittest.skipUnless(os.name == "posix", "the execute permission")
+    def test_a_file_without_the_execute_permission_is_not_called_missing(self):
+        plain = os.path.join(self.tmp, "plain")
+        with open(plain, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n")
+        os.chmod(plain, 0o644)
+        for how in ("run", "learn", "cli"):
+            with self.subTest(how=how):
+                code, err = self.refused([plain], how)
+                self.assertEqual(code, 2)
+                self.assertIn(self.NEEDLE + plain, err)
+                self.assertNotIn("PATH", err)
+
+    def test_a_command_that_is_not_there_says_the_same_thing(self):
+        missing = "mcp-jail-no-such-command-xyz"
+        for how in ("run", "learn", "cli"):
+            with self.subTest(how=how):
+                code, err = self.refused([missing], how)
+                self.assertEqual(code, 2)
+                self.assertIn(self.NEEDLE + missing, err)
+                self.assertEqual(err.count("\n"), 1, err)
+
+    @unittest.skipUnless(os.name == "posix", "an executable text file with no #!")
+    def test_an_executable_that_the_system_cannot_run_is_exit_2_not_a_traceback(self):
+        script = os.path.join(self.tmp, "noshebang")
+        with open(script, "w", encoding="utf-8") as f:
+            f.write("echo hi\n")
+        os.chmod(script, 0o755)
+        for how in ("run", "learn", "cli"):
+            with self.subTest(how=how):
+                code, err = self.refused([script], how)
+                self.assertEqual(code, 2)
+                self.assertIn(f"cannot start the server command {script}: ", err)
+                self.assertNotIn("Traceback", err)
+
+    def test_whatever_the_system_refuses_is_reported_with_its_reason(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        for exc in (PermissionError(13, "Permission denied"),
+                    FileNotFoundError(2, "No such file or directory"),
+                    OSError(8, "Exec format error")):
+            for how in ("run", "learn"):
+                with self.subTest(exc=type(exc).__name__, how=how):
+                    err = io.StringIO()
+                    with mock.patch.object(jail_mod.subprocess, "Popen",
+                                           side_effect=exc):
+                        with redirect_stderr(err), redirect_stdout(io.StringIO()):
+                            if how == "run":
+                                code = jail_mod.run(
+                                    pol, [sys.executable],
+                                    stdin=io.BytesIO(b""), stdout=io.BytesIO())
+                            else:
+                                code = jail_mod.learn(
+                                    [sys.executable], stdin=io.BytesIO(b""),
+                                    stdout=io.BytesIO())
+                    self.assertEqual(code, 2)
+                    self.assertIn(f"cannot start the server command "
+                                  f"{sys.executable}: {exc.strerror}",
+                                  err.getvalue())
+
+    def test_the_readme_says_so(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        self.assertFalse("(not on PATH)" in flat or
+                         "is not on `PATH`" in flat, "the old wording is left")
+        for needle in ("a command that cannot be run is a clean `exit 2`",
+                       "not on `PATH`, a directory, a file without the "
+                       "execute permission",
+                       "a server command that is not found or not executable"):
+            self.assertTrue(needle in flat, needle)
+
+
 class TestShutdown(ProxyCase):
     """J-9: the server exiting while the client still holds our stdin open
     used to abort the proxy with a fatal `_enter_buffered_busy` (rc -6). It
@@ -1900,6 +2175,110 @@ class TestDocs(unittest.TestCase):
         for flag in ("--init-policy", "--force", "--audit", "--limit", "--policy"):
             self.assertIn(flag, text)
         self.assertIn("mcp-jail learn", text)
+
+
+class TestReadmeMatchesTheCli(ProxyCase):
+    """R7 mcp-jail #4 and #6: the README said --audit "shows every field of a
+    record" (it shows the decision, the tool and the reason), and left out
+    --init-policy's --path and --force."""
+
+    def readme(self) -> str:
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            return f.read()
+
+    def options_in_help(self, argv) -> set:
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                cli_mod.main(argv + ["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        return set(re.findall(r"(?<![\w-])--[a-z][a-z-]*", out.getvalue()))
+
+    def test_every_option_the_help_lists_is_in_the_readme(self):
+        readme = self.readme()
+        for argv in ([], ["learn"]):
+            flags = self.options_in_help(argv) - {"--help"}
+            self.assertGreaterEqual(len(flags), 4, (argv, flags))
+            for flag in sorted(flags):
+                found = re.search(re.escape(flag) + r"(?![\w-])", readme)
+                self.assertTrue(found, f"{flag} (mcp-jail {' '.join(argv)}) "
+                                       f"is not in the README")
+        # the two that were missing, by name
+        main_flags = self.options_in_help([])
+        self.assertLessEqual({"--path", "--force"}, main_flags)
+
+    def test_init_policy_path_and_force_work_as_the_readme_says(self):
+        target = os.path.join(self.tmp, "sub", "mine.json")
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_mod.main(["--init-policy", "--path", target]), 0)
+        jail_mod.load_policy(target)              # a starter policy that loads
+        with open(target, "w", encoding="utf-8") as f:
+            f.write("{}")
+        err = io.StringIO()
+        with redirect_stdout(io.StringIO()), redirect_stderr(err):
+            self.assertEqual(cli_mod.main(["--init-policy", "--path", target]), 2)
+        self.assertIn("use --force", err.getvalue())
+        with open(target, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "{}")      # left alone
+        with redirect_stdout(io.StringIO()):
+            self.assertEqual(cli_mod.main(
+                ["--init-policy", "--path", target, "--force"]), 0)
+        jail_mod.load_policy(target)              # replaced
+        flat = " ".join(self.readme().split())
+        for needle in ("mcp-jail --init-policy --path my.json",
+                       "mcp-jail --init-policy --force",
+                       "`--path FILE` writes it there instead",
+                       "unless you add `--force`"):
+            self.assertTrue(needle in flat, needle)
+
+    def test_audit_shows_the_decision_the_tool_and_the_reason_and_no_more(self):
+        record = {"decision": "deny", "tool": "run_cmd", "reason": "no way",
+                  "args": {"cmd": "rm -rf /"}, "at": 1700000000}
+        with open(jail_mod.AUDIT_LOG, "w", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            self.assertEqual(
+                cli_mod.cmd_audit(argparse.Namespace(limit=50)), 0)
+        self.assertEqual(out.getvalue().splitlines(),
+                         ["DENY  run_cmd no way", "",
+                          "1 denied in last 1 calls"])
+        self.assertNotIn("rm -rf", out.getvalue())
+        self.assertNotIn("1700000000", out.getvalue())
+
+    def test_the_readme_says_what_audit_shows_and_what_it_leaves_in_the_file(self):
+        flat = " ".join(self.readme().split())
+        self.assertFalse("shows every field of a record" in flat,
+                         "the old, untrue sentence")
+        for needle in ("Each record is one line of printable text",
+                       "the arguments and the time are in the file, not in "
+                       "this report"):
+            self.assertTrue(needle in flat, needle)
+
+
+class TestTempDirectories(unittest.TestCase):
+    """R7 mcp-jail, test hygiene: mktemp() made directories that nothing
+    removed (four tests, in the system temp directory, on every run). Every
+    directory the tests make is now inside one that tearDownModule removes."""
+
+    def test_mktemp_makes_its_directories_inside_the_private_base(self):
+        made = mktemp()
+        self.assertEqual(os.path.dirname(made), _base)
+        self.assertTrue(os.path.isdir(made))
+        self.assertEqual(os.path.dirname(_fake_home), _base)
+
+    def test_a_run_that_makes_directories_leaves_the_temp_directory_empty(self):
+        scratch = tempfile.mkdtemp(prefix="mjleak", dir=_base)
+        env = child_env()
+        for var in ("TMPDIR", "TEMP", "TMP"):
+            env[var] = scratch
+        # TestCLI and TestArgRulePaths are the classes that made mktemp() dirs
+        proc = subprocess.run(
+            [sys.executable, "-m", "unittest", "tests.test_jail.TestCLI",
+             "tests.test_jail.TestArgRulePaths"],
+            cwd=REPO, env=env, capture_output=True, text=True, timeout=300)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(os.listdir(scratch), [])
 
 
 # --------------------------------------------------------------------------
@@ -2791,6 +3170,78 @@ class TestPolicyKeys(ProxyCase):
             jail_mod.compile_policy({"hide_denied": "yes"})
         jail_mod.compile_policy({"allow_tools": ["a", "b"], "deny_tools": [],
                                  "hide_denied": False})
+
+    def test_tool_name_lists_refuse_an_object_or_a_set(self):
+        """R7 mcp-jail #1: allow_tools / deny_tools took a JSON object and
+        kept only its keys, so the rules nested in it were dropped and the
+        tool was allowed without them."""
+        for key in ("allow_tools", "deny_tools"):
+            for bad in ({}, {"read_file": {"path": "^/safe/"}},
+                        {"read_file": {"allow": {"path": ["^/safe/"]}}},
+                        {"*": "everything"}, {"read_file": True}):
+                with self.assertRaises(ValueError, msg=(key, bad)) as cm:
+                    jail_mod.compile_policy({key: bad})
+                msg = str(cm.exception)
+                self.assertTrue(msg.startswith(f"{key} must be a list of tool "
+                                               f"names, not an object"), msg)
+                # and says where argument rules go
+                self.assertIn("arg_rules", msg)
+            for bad in ({"read_file"}, frozenset({"read_file"}), set()):
+                with self.assertRaises(ValueError, msg=(key, bad)) as cm:
+                    jail_mod.compile_policy({key: bad})
+                self.assertIn(f"{key} must be a list of tool names",
+                              str(cm.exception))
+        # the lists that are accepted, a tuple included, still are
+        jail_mod.compile_policy({"allow_tools": ("a",), "deny_tools": ["b"]})
+        jail_mod.compile_policy({"allow_tools": [], "deny_tools": None})
+
+    def test_no_other_list_in_a_policy_takes_an_object(self):
+        # the sweep behind that finding: every list-typed key is a list
+        for key in ("policed_methods", "deny_methods"):
+            for bad in ({}, {"tools/call": {"x": 1}}, {"tools/call"}):
+                with self.assertRaises(ValueError, msg=(key, bad)) as cm:
+                    jail_mod.compile_policy({key: bad})
+                self.assertIn(f"{key} must be a list", str(cm.exception))
+
+    def test_an_object_for_allow_tools_is_not_a_way_to_nest_rules(self):
+        # the panel's repro: the rules in the object were dropped, so
+        # read_file was allowed with any path
+        marker = os.path.join(self.tmp, "started.txt")
+        srv = self.srv("open(%r, 'w').write('x')\n" % marker, "marker.py")
+        raw = {"allow_tools": {"read_file": {"path": "^/safe/"}}}
+        pol = write_policy(self.tmp, raw)
+        with self.assertRaises(ValueError):
+            jail_mod.load_policy(pol)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, lines = drive_rc(pol, [sys.executable, srv],
+                                   [call(1, "read_file", {"path": "/etc/passwd"})])
+        self.assertEqual((code, lines), (2, []))
+        self.assertIn("bad policy", err.getvalue())
+        self.assertIn("arg_rules", err.getvalue())
+        self.assertFalse(os.path.exists(marker),
+                         "the server was started under a refused policy")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(cli_mod.main(
+                ["--policy", pol, "--", sys.executable, srv]), 2)
+        self.assertFalse(os.path.exists(marker))
+        # the spelling the message points to does hold the path to /safe/
+        good = compiled({"allow_tools": ["read_file"], "arg_rules": {
+            "read_file": {"allow": {"path": ["^/safe/"]}}}})
+        self.assertTrue(jail_mod.tool_allowed(
+            good, "read_file", {"path": "/safe/a.txt"})[0])
+        self.assertFalse(jail_mod.tool_allowed(
+            good, "read_file", {"path": "/etc/passwd"})[0])
+
+    def test_the_readme_says_an_object_is_refused(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        for needle in ("a tool list that is anything but a list of non-empty "
+                       "strings",
+                       "an object there would keep only its keys and drop the "
+                       "rules nested in it",
+                       "argument rules go under `arg_rules`"):
+            self.assertTrue(needle in flat, needle)
 
 
 # A server written the way a Java/Jackson one is: its lines come from
@@ -4453,9 +4904,13 @@ class TestDenyWildcard(ProxyCase):
                     self.assertIn("denied by policy", reason)
                     self.assertFalse(jail_mod.tool_visible(pol, tool)[0])
 
-    def test_a_deny_list_that_is_an_object_counts_too(self):
-        pol = compiled({"allow_tools": ["*"], "deny_tools": {"*": "everything"}})
-        self.assertFalse(jail_mod.tool_allowed(pol, "read_file", {})[0])
+    def test_a_deny_list_that_is_an_object_is_refused(self):
+        # its keys used to count; no object is a tool list now (R7 mcp-jail
+        # #1), and a refused policy runs nothing, so nothing is let through
+        with self.assertRaises(ValueError) as cm:
+            jail_mod.compile_policy({"allow_tools": ["*"],
+                                     "deny_tools": {"*": "everything"}})
+        self.assertIn("deny_tools must be a list", str(cm.exception))
 
     def test_other_deny_lists_and_an_ordinary_policy_are_unchanged(self):
         pol = compiled({"allow_tools": ["*"], "deny_tools": ["delete_all"]})
@@ -5180,6 +5635,192 @@ class TestClosedStandardStreams(ProxyCase):
                 self.assertNotIn("Traceback", proc.stderr)
                 self.assertEqual(proc.stderr.count("\n"), 1, proc.stderr)
                 self.assertIn(want, proc.stderr)
+
+
+class TestClosedStandardError(ProxyCase):
+    """R7 mcp-jail #2: started with its standard error closed (`2>&-`; pythonw
+    on Windows), Python has None for sys.stderr, and print(..., file=None)
+    writes to standard OUTPUT: "server did not answer 1 request" landed in the
+    protocol stream, and in the policy `learn` writes, while the messages
+    written with sys.stderr.write died with an AttributeError - exit status 1
+    where 2 is documented. With nowhere to say it, the jail says nothing."""
+
+    def quiet_run(self, fn, *args, **kwargs):
+        """(fn(...), what reached sys.stdout) while sys.stderr is None."""
+        leaked = io.StringIO()
+        with mock.patch.object(sys, "stderr", None), redirect_stdout(leaked):
+            result = fn(*args, **kwargs)
+        return result, leaked.getvalue()
+
+    def quiet_exit(self, fn, *args):
+        """(exit code, what reached sys.stdout) of fn(...), which exits."""
+        leaked = io.StringIO()
+        with mock.patch.object(sys, "stderr", None), redirect_stdout(leaked):
+            with self.assertRaises(SystemExit) as cm:
+                fn(*args)
+        return cm.exception.code, leaked.getvalue()
+
+    @staticmethod
+    def streams():
+        return {"stdin": io.BytesIO(b""), "stdout": io.BytesIO()}
+
+    def test_run_refuses_with_exit_2_and_says_nothing_on_stdout(self):
+        good = write_policy(self.tmp, ALLOW_ALL)
+        bad = os.path.join(self.tmp, "bad.json")
+        with open(bad, "w", encoding="utf-8") as f:
+            f.write("{not json")
+        for name, pol, cmd, extra in (
+                ("no policy", os.path.join(self.tmp, "nope.json"), ["x"], {}),
+                ("bad policy", bad, ["x"], {}),
+                ("policy is a directory", self.tmp, ["x"], {}),
+                ("bad timeout", good, ["x"], {"timeout": float("nan")}),
+                ("no such server", good,
+                 [os.path.join(self.tmp, "no-such-server")], {})):
+            with self.subTest(case=name):
+                code, leaked = self.quiet_run(jail_mod.run, pol, cmd,
+                                              **self.streams(), **extra)
+                self.assertEqual(code, 2)
+                self.assertEqual(leaked, "")
+
+    def test_a_notice_about_the_session_does_not_enter_the_protocol_stream(self):
+        # the panel's repro: a silent server, --timeout 1, one request
+        hang = self.srv(FAKE_HANG, "hang.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        (code, raw), leaked = self.quiet_run(
+            drive_rc, pol, [sys.executable, hang], [call(1, "slow", {})],
+            timeout=1)
+        self.assertEqual(code, 3)
+        self.assertEqual(leaked, "")
+        self.assertEqual([json.loads(ln)["id"] for ln in raw], [1])
+
+    def test_an_unwritable_audit_log_is_not_reported_on_stdout(self):
+        blocker = os.path.join(self.tmp, "a-file")
+        with open(blocker, "w", encoding="utf-8") as f:
+            f.write("x")
+        jail_mod.AUDIT_LOG = os.path.join(blocker, "audit.jsonl")  # tearDown
+        pol = write_policy(self.tmp, ALLOW_ALL)                    # restores
+        (code, raw), leaked = self.quiet_run(
+            drive_rc, pol, [sys.executable, self.server],
+            [call(1, "read_file", {})])
+        self.assertEqual(code, 0)
+        self.assertIn("result", json.loads(raw[0]))
+        self.assertEqual(leaked, "")
+
+    def calls_script(self) -> str:
+        path = os.path.join(self.tmp, "calls.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"tool": "read_file", "arguments": {"path": "/a"}}], f)
+        return path
+
+    def test_learn_keeps_its_stdout_for_the_policy(self):
+        code, leaked = self.quiet_run(
+            jail_mod.learn, [sys.executable, self.server],
+            script=self.calls_script(), timeout=10)
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(leaked)["allow_tools"], ["read_file"])
+        # what it refuses to do, it refuses without a word on stdout
+        code, leaked = self.quiet_run(
+            jail_mod.learn, [sys.executable, self.server],
+            script=os.path.join(self.tmp, "no-script.json"))
+        self.assertEqual((code, leaked), (2, ""))
+
+    def test_the_command_line_says_nothing_on_stdout_either(self):
+        existing = os.path.join(self.tmp, "policy.json")
+        with open(existing, "w", encoding="utf-8") as f:
+            f.write("{}")
+        for argv in (["--init-policy", "--path", existing], [], ["learn"]):
+            with self.subTest(argv=argv):
+                code, leaked = self.quiet_run(cli_mod.main, argv)
+                self.assertEqual((code, leaked), (2, ""))
+        # argparse would print the usage on stdout: it takes None for "stdout"
+        for argv in (["--timeout", "soon"], ["--no-such-option"],
+                     ["learn", "--timeout", "soon"], ["learn", "--bogus"]):
+            with self.subTest(argv=argv):
+                self.assertEqual(self.quiet_exit(cli_mod.main, argv), (2, ""))
+        # asking for the help or the version is not a complaint
+        code, shown = self.quiet_exit(cli_mod.main, ["--version"])
+        self.assertEqual(code, 0)
+        self.assertIn("mcp-jail", shown)
+
+    def test_a_stderr_that_cannot_be_written_to_ends_nothing(self):
+        class Gone:
+            def write(self, text):
+                raise BrokenPipeError(32, "Broken pipe")
+
+        shut = io.StringIO()
+        shut.close()
+        for name, err in (("reader gone", Gone()), ("closed", shut)):
+            with self.subTest(stderr=name), mock.patch.object(
+                    sys, "stderr", err):
+                jail_mod._say("anything")                 # does not raise
+                code = jail_mod.run(os.path.join(self.tmp, "nope.json"),
+                                    ["x"], **self.streams())
+                self.assertEqual(code, 2)
+
+    CLOSE_FD_2 = ("import os, sys\n"
+                  "os.close(2)\n"
+                  "os.execv(sys.executable, [sys.executable, '-m', "
+                  "'mcp_jail'] + sys.argv[1:])\n")
+
+    def with_stderr_closed(self, argv, stdin: bytes = b""):
+        return subprocess.run(
+            [sys.executable, "-c", self.CLOSE_FD_2] + argv, env=child_env(),
+            input=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=60)
+
+    @unittest.skipUnless(os.name == "posix", "closes a descriptor before exec")
+    def test_started_with_standard_error_closed(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        nope = os.path.join(self.tmp, "nope.json")
+        # a refusal is exit 2 (it was a crash, 1) and puts nothing on stdout
+        for argv in (["--policy", nope, "--", sys.executable, "-c", "pass"],
+                     ["--policy", pol, "--", os.path.join(self.tmp, "nobody")],
+                     ["--policy", pol, "--timeout", "nan", "--", "x"]):
+            with self.subTest(argv=argv):
+                proc = self.with_stderr_closed(argv)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(proc.stdout, b"")
+        # the panel's repro: one ping, a silent server, --timeout 1
+        silent = write_server(self.tmp, "import sys\nsys.stdin.read()\n",
+                              "silent.py")
+        ping = b'{"jsonrpc":"2.0","id":1,"method":"ping"}\n'
+        proc = self.with_stderr_closed(
+            ["--policy", pol, "--timeout", "1", "--", sys.executable, silent],
+            stdin=ping)
+        self.assertEqual(proc.returncode, 3)
+        lines = [ln for ln in proc.stdout.split(b"\n") if ln.strip()]
+        self.assertEqual(len(lines), 1, proc.stdout)   # the reply, and no more
+        reply = json.loads(lines[0])
+        self.assertEqual((reply["id"], reply["error"]["code"]), (1, -32603))
+        # learn: stdout is the policy and nothing else
+        proc = self.with_stderr_closed(
+            ["learn", "--script", self.calls_script(), "--timeout", "10", "--",
+             sys.executable, self.server])
+        self.assertEqual(proc.returncode, 0)
+        self.assertEqual(json.loads(proc.stdout)["allow_tools"], ["read_file"])
+
+    def test_nothing_writes_to_sys_stderr_except_say(self):
+        # print(..., file=sys.stderr) is the bug itself when it is None, and
+        # sys.stderr.write is an AttributeError: every notice goes through
+        # jail._say, which knows both (the tests above run the paths that
+        # matter; this one covers the ones they do not)
+        pkg = os.path.join(REPO, "mcp_jail")
+        names = sorted(n for n in os.listdir(pkg) if n.endswith(".py"))
+        self.assertIn("jail.py", names)
+        for name in names:
+            with open(os.path.join(pkg, name), encoding="utf-8") as f:
+                found = re.findall(r"file=sys\.stderr|sys\.stderr\.write",
+                                   f.read())
+            self.assertEqual(found, [], name)
+
+    def test_the_readme_says_what_a_closed_stderr_means(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            flat = " ".join(f.read().split())
+        for needle in ("With standard error closed (`2>&-`; `pythonw` on "
+                       "Windows) there is nowhere for that line to go",
+                       "never written to standard output",
+                       "and the exit status is the same"):
+            self.assertTrue(needle in flat, needle)
 
 
 # Echoes params.x back; when started with a digit count it instead answers
