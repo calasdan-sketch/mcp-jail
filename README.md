@@ -84,7 +84,15 @@ Leaving `allow_tools` out is allowed and means "every tool that
 A policy path that is a directory, or cannot be read, is the same exit
 `2`, not a traceback.
 
-- `allow_tools` / `deny_tools`: tool names (`*` = all). Deny wins.
+- `allow_tools` / `deny_tools`: tool names (`*` on its own = all). Deny
+  wins: `"deny_tools": ["*"]` refuses every call and hides every tool,
+  whatever `allow_tools` says. `*` is a wildcard only on its own, not a
+  pattern inside a name: `delete_*` is not "every delete tool". So
+  `deny_tools` refuses such an entry when the policy loads (exit `2`)
+  instead of letting it deny nothing, an `arg_rules` key or a
+  `policed_methods` entry with a `*` in it is refused the same way, and
+  an `allow_tools` entry like that simply matches no tool.
+  (`deny_methods`, below, is the list that takes globs.)
   Names are compared **normalised** — Unicode NFKC, case-folded,
   trimmed, invisible characters (zero-width space, soft hyphen, BOM,
   control and combining marks) removed — so `Delete_All`,
@@ -170,22 +178,45 @@ full, which `--grace 0` (stop the server as soon as the jail's own work is
 done, the way mcp-jail used to) can lose. `learn` without `--script` ends
 its session the same way and takes `--grace` too.
 
-`mcp-jail --audit` shows every field of a record as printable text on
-one line: a newline, a terminal escape sequence or a bidi override in a
-reason or a tool name (the client chooses it) is shown as an escape
-(`\n`, `\x1b`, `\u202e`), so it cannot forge a line of the report or
-drive your terminal.
+**Signals.** SIGTERM and SIGHUP end a session the way the client leaving
+does: mcp-jail stops reading the client, closes the server's stdin once
+what is queued is written, waits up to `--grace` for the server to exit
+(relaying, checking and auditing whatever it still says), stops it if it
+does not, and exits `143` or `129` (128 plus the signal number). If the
+client had already left, so that mcp-jail was waiting out `--grace`, the
+signal ends the wait. A second signal does not wait at all: the server is
+killed and mcp-jail ends at once. Ctrl-C (SIGINT) stops the server at once
+and exits `0`, as before. A signal that was being ignored when mcp-jail
+started (`nohup` does that for SIGHUP) still is. On Windows there is no
+SIGTERM or SIGHUP to catch: Ctrl-Break (SIGBREAK) takes the same path
+(exit `149`, 128 plus its number, 21), and closing the console window or
+logging off ends the process outright, with no chance to tidy up.
+`learn` ends a live session on these signals as it does on Ctrl-C, and
+writes the policy; `learn --script` drives the server from a single thread
+and does not catch them.
+
+`mcp-jail --audit` shows the last 50 records, or the last N with
+`--limit N` (a whole number, 1 or more: anything else is exit `2`). It
+shows every field of a record as printable text on one line: a newline,
+a terminal escape sequence or a bidi override in a reason or a tool name
+(the client chooses it) is shown as an escape (`\n`, `\x1b`, `\u202e`),
+so it cannot forge a line of the report or drive your terminal.
 
 ## Exit codes
 
 | code | meaning |
 |------|---------|
 | `0`  | a clean session: the client finished and every request it sent was answered (a denied call is the jail doing its job, not a failure); or `--audit` / `--init-policy` / `learn` succeeded |
-| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not on `PATH`, an option value that is not a finite number of seconds, a `learn` session that ended early |
+| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not on `PATH`, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early |
 | `3`  | the server failed while the jail was relaying: it exited or closed its pipes while the client was still talking to it, stopped reading its input, or left a request unanswered past `--timeout` |
+| `143`, `129` | mcp-jail was told to stop by SIGTERM or SIGHUP and wound the session down first (128 plus the signal number; see *Signals* above) |
 
-A wrapper (a CI job, a supervisor) can tell a server that died on
-start-up from a session that ran.
+A wrapper (a CI job, a supervisor) can rely on the exit status for what
+happened to the requests the client made, and on a line on stderr that
+says why it is `3`. A client that sends nothing is asking nothing of the
+server, so that session is `0` whatever became of the server; to check
+that a server starts, send it `initialize`: a server that has died by
+then is `3`.
 
 ## Argument paths
 
@@ -247,7 +278,7 @@ denied too.
 ## Policy authoring
 
 Policies are JSON. `allow_tools` / `deny_tools` are tool names
-(`*` = all, deny wins). `arg_rules` map argument paths to regexes, as
+(a lone `*` = all, deny wins). `arg_rules` map argument paths to regexes, as
 above.
 
 **Honest limitation — read this before writing deny patterns.**
@@ -392,18 +423,21 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
   **refused**, not repaired: a raw control character anywhere in the
   line (CR, TAB, NUL, ...; JSON has `\r` and `\t` for text), a
   duplicate key at any depth, `NaN` / `Infinity` / a number a double
-  cannot hold (`1e999`), invalid UTF-8, a request without a string
-  `method`, a response that is not exactly one of `result` and `error`
-  (or that also names a `method`). A refused client message gets
-  `-32700` / `-32600` under its own id (null when it has none, or none
-  that can be trusted), a refused server message fails the request it
-  answers (`-32603 bad response from server: ...`) or is dropped with a
-  line on stderr, and each lands in the audit log as a `deny` record
-  with `rejected` set to `client` or `server` (the offending line, cut
-  to 200 characters, is kept unless `audit_args` is `none`).
-  Integers of any size are exact; a decimal with more digits than an
-  IEEE double holds is rounded to the nearest double, as every
-  double-based parser would (see *Limitations*).
+  cannot hold (`1e999`), an integer of more than 4300 digits, invalid
+  UTF-8, a request without a string `method`, a response that is not
+  exactly one of `result` and `error` (or that also names a `method`).
+  A refused client message gets `-32700` / `-32600` under its own id
+  (null when it has none, or none that can be trusted), a refused server
+  message fails the request it answers (`-32603 bad response from
+  server: ...`) or is dropped with a line on stderr, and each lands in
+  the audit log as a `deny` record with `rejected` set to `client` or
+  `server` (the offending line, cut to 200 characters, is kept unless
+  `audit_args` is `none`).
+  Integers of up to 4300 digits are exact (Python's own limit on reading
+  one, which mcp-jail applies on every Python version: a longer one is a
+  number the jail cannot carry, so the message is refused like `1e999`);
+  a decimal with more digits than an IEEE double holds is rounded to the
+  nearest double, as every double-based parser would (see *Limitations*).
 - **Member names are exact.** Some JSON readers (Go's `encoding/json`,
   C#'s `System.Text.Json` and Jackson when so configured) match member
   names without regard to case and let the last duplicate win, so
@@ -429,13 +463,27 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
   server is delivered once, as one array.
 - JSON-RPC batch arrays from the client are split and handled element
   by element.
+- A request the client cancels is no longer awaited. `notifications/cancelled`
+  goes to the server like any client notification (unless `deny_methods`
+  drops it: then the request is awaited as ever), and the jail stops
+  timing the request it names: it gets no `server timed out` error, does
+  not count towards exit status `3`, and does not hold up the end of the
+  session or the `--grace` shutdown. The SDK servers send no reply to a
+  cancelled request; one that replies anyway (the spec allows the race) is
+  dropped without a word, as the client is to ignore it. A cancel whose
+  `requestId` the jail is not waiting for (unknown, already answered, not a
+  string or a number, or another spelling of the id: see above) is passed
+  on and changes nothing. MCP does not let a client cancel `initialize`:
+  such a cancel is not passed on, and it is in the audit log as a rejected
+  client message.
 - A request the server never answers within `--timeout` gets a
   `-32603 server timed out` error (and the session ends with exit status
-  `3`); a response that arrives later for that id is dropped, so the
-  client never sees two answers. A non-JSON
-  line on the server's stdout (npm servers `console.log()` banners and
-  progress there) answers nothing: it is reported on stderr and
-  skipped, never charged to a pending request, whose real answer still
+  `3`, after a line on stderr that counts them: `server did not answer 2
+  requests within 30s`); a response that arrives later for that id is
+  dropped, so the client never sees two answers. A non-JSON line on the
+  server's stdout (npm servers `console.log()` banners and progress
+  there) answers nothing: it is reported on stderr and skipped, never
+  charged to a pending request, whose real answer still
   gets through; a wedged server is caught by `--timeout`. Malformed
   input from the client gets `-32700` / `-32600` as the spec says —
   including JSON nested a hundred thousand levels deep, which is an
@@ -470,10 +518,11 @@ patterns and on `learn` above apply as well):
   that is reading it, so mcp-jail exits when that grandchild lets go or
   ends.
 - **Numbers are re-written as an IEEE double would write them.** Integers
-  of any size are exact; a decimal with more significant digits than a
-  double holds (about 17) is rounded to the nearest double, and `1E2`
-  arrives as `100.0`. The jail cannot forward the original digits without
-  forwarding the original bytes.
+  of up to 4300 digits are exact (a longer one is refused, as above); a
+  decimal with more significant digits than a double holds (about 17) is
+  rounded to the nearest double, and `1E2` arrives as `100.0`. The jail
+  cannot forward the original digits without forwarding the original
+  bytes.
 
 ## Why not just audit?
 

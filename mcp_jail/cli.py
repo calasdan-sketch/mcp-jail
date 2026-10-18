@@ -90,6 +90,20 @@ def _seconds(text: str) -> float:
     return value
 
 
+def _positive_count(text: str) -> int:
+    """argparse type for --limit: a whole number, 1 or more. int() alone takes
+    0 (which showed the whole log) and negatives (which dropped lines): the
+    log is cut with a slice that counts from the end."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a whole number") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"{text!r} is not 1 or more")
+    return value
+
+
 def cmd_init_policy(args) -> int:
     path = jail_mod.expand_path(args.path)
     if os.path.exists(path) and not args.force:
@@ -196,7 +210,8 @@ def build_parser() -> argparse.ArgumentParser:
                "exit status: 0 a clean session; 2 an unusable policy or "
                "command; 3 the server failed (it exited or closed its pipes, "
                "stopped reading its input, or did not answer a request "
-               "within --timeout)")
+               "within --timeout); 128+N (143, 129) stopped by SIGTERM or "
+               "SIGHUP after closing the server's input and waiting --grace")
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     p.add_argument("--policy", default=default_policy, metavar="FILE",
                    help=f"policy file; ~ and environment variables are "
@@ -212,9 +227,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--audit", action="store_true",
                    help="print the last --limit audit-log entries "
                         "(allow/deny per tool call) and exit")
-    p.add_argument("--limit", type=int, default=50, metavar="N",
-                   help="how many audit entries --audit shows "
-                        "(default: 50)")
+    p.add_argument("--limit", type=_positive_count, default=50, metavar="N",
+                   help="how many audit entries --audit shows: the last N, "
+                        "a whole number, 1 or more (default: 50)")
     p.add_argument("--timeout", type=_seconds, default=30.0, metavar="SECS",
                    help="seconds to wait for each server response, and for "
                         "the server to take each message off its stdin "

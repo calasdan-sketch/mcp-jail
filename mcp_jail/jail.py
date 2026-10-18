@@ -21,15 +21,19 @@ runs the same way on Windows as on POSIX (no select() on pipes).
 from __future__ import annotations
 
 import collections
+import contextlib
 import difflib
 import fnmatch
+import heapq
 import io
+import itertools
 import json
 import math
 import os
 import queue
 import re
 import shutil
+import signal
 import stat
 import string
 import subprocess
@@ -51,13 +55,17 @@ _WINDOWS = os.name == "nt"
 # Exit codes: 0 a clean session, 2 unusable policy / script / command (or a
 # learn session that ended early), 3 the server failed while the jail was
 # relaying: it exited or closed its pipes, stopped reading its input, or did
-# not answer a request within --timeout.
+# not answer a request within --timeout. 128 plus the signal number (143,
+# 129): the jail was told to stop by SIGTERM / SIGHUP (see _StopSignals).
 EXIT_SERVER = 3
 
-# The longest one wait on the queue may last. threading refuses a longer
-# timeout outright (OverflowError, a traceback), and the loop looks at its
-# deadlines again on every pass, so nothing is lost by waking up now and then.
-_MAX_BLOCK = 3600.0
+# The longest one wait on the queue may last. A wait that never ends cannot be
+# interrupted on Windows (a lock is not alerted by a console event, so the
+# handler for Ctrl-C only runs when the call returns), and one that is too
+# long is refused outright by threading (OverflowError, a traceback). The loop
+# looks at its deadlines again on every pass, so nothing is lost by waking up
+# twice a second, and idle that costs next to nothing.
+_IDLE_WAKE = 0.5
 
 # Once the client has gone and nothing is owed, the server is given this many
 # seconds to finish and exit on its own (--grace; 0 stops it at once). One that
@@ -90,6 +98,30 @@ def _refuse_seconds(**options) -> "str | None":
         if why is not None:
             return f"--{name} {value!r} {why}"
     return None
+
+
+def _missing_streams(client_in, client_out) -> "str | None":
+    """Why the jail cannot talk to its client when a standard stream it is to
+    use is not there (None: both are). A process started with its stdin or
+    stdout closed - by a supervisor that forgot a pipe, or pythonw on
+    Windows - has None for it."""
+    shut = [name for name, stream in (("input", client_in),
+                                      ("output", client_out))
+            if stream is None]
+    if len(shut) == 2:
+        return ("standard input and output are closed (the client talks to "
+                "mcp-jail over them)")
+    if shut == ["input"]:
+        return "standard input is closed (the client's messages arrive on it)"
+    if shut == ["output"]:
+        return "standard output is closed (the server's answers go out on it)"
+    return None
+
+
+def _say(line: str) -> None:
+    """One line on stderr; a process without one has nothing to say it on."""
+    if sys.stderr is not None:
+        sys.stderr.write(line + "\n")
 
 # ---------------------------------------------------------------------------
 # paths
@@ -485,6 +517,10 @@ def compile_policy(pol: dict) -> dict:
             raise ValueError(f"arg_rules.{tool} must be an object with "
                              f"'allow' and/or 'deny'")
         _check_keys(rules, RULE_KEYS, f"arg_rules.{tool}")
+        if "*" in normalize_tool_name(tool):
+            raise ValueError(f"arg_rules: {tool!r} is not a tool name - '*' "
+                             f"is not a wildcard in arg_rules keys, each key "
+                             f"names one tool (write a rule for each)")
         allow = rules.get("allow")
         if allow == "*":
             pass  # explicit: any arguments (deny rules still apply)
@@ -509,8 +545,20 @@ def compile_policy(pol: dict) -> dict:
             if not isinstance(entry, str) or not entry:
                 raise ValueError(f"{key} must hold tool name strings, "
                                  f"got {entry!r}")
+            if key == "deny_tools" and _star_inside(entry):
+                raise ValueError(f"deny_tools: {entry!r} is not a pattern - "
+                                 f"'*' means every tool only on its own, any "
+                                 f"other entry is an exact name (list each "
+                                 f"tool)")
     for key in ("policed_methods", "deny_methods"):
-        _method_list(pol, key)
+        methods = _method_list(pol, key)
+        if key == "policed_methods":
+            for m in methods:
+                if "*" in normalize_tool_name(m):
+                    raise ValueError(f"policed_methods: {m!r} is not a method "
+                                     f"name - '*' is not a wildcard here, "
+                                     f"list the methods (\"prompts/get\", "
+                                     f"\"resources/read\")")
     mode = pol.get("audit_args", "denied")
     if mode not in AUDIT_ARGS_MODES:
         raise ValueError(f"audit_args must be one of {AUDIT_ARGS_MODES}, "
@@ -642,6 +690,23 @@ def _name_listed(name_norm: str, names) -> bool:
                for t in names)
 
 
+def _denied_by_name(name_norm: str, deny) -> bool:
+    """Does deny_tools name this tool? An entry that is a lone `*` names
+    every tool - entries are read the way tool names are, so a fullwidth
+    asterisk, or one with a space or a zero-width character beside it, is
+    that `*` too. (It used to name a tool called `*` and nothing else.)"""
+    return any(isinstance(t, str) and normalize_tool_name(t) in ("*", name_norm)
+               for t in deny)
+
+
+def _star_inside(name: str) -> bool:
+    """A `*` in the middle of a name (`delete_*`), as names are compared. A
+    lone `*` is the wildcard and does not count; nothing else here is a
+    pattern, so such an entry would name a tool that does not exist."""
+    norm = normalize_tool_name(name)
+    return "*" in norm and norm != "*"
+
+
 def tool_visible(pol: dict, name) -> tuple[bool, str]:
     """Name-level decision: deny_tools / allow_tools only. This is what
     hide_denied uses for tools/list — argument rules are per-call and
@@ -656,7 +721,7 @@ def tool_visible(pol: dict, name) -> tuple[bool, str]:
     allow = pol.get("allow_tools")
     if allow is None:
         allow = ["*"]
-    if _name_listed(norm, deny):
+    if _denied_by_name(norm, deny):
         return False, f"tool '{name}' is denied by policy"
     if "*" not in allow and not _name_listed(norm, allow):
         return False, f"tool '{name}' is not in allow_tools"
@@ -842,12 +907,23 @@ INVALID_PARAMS, INTERNAL_ERROR = -32602, -32603
 _NO_ID = object()
 
 
+def _int_or_none(text: str):
+    """parse_int hook for the lookups of an id in a line _parse refused: an
+    integer too long for Python to read (another reason to refuse the line)
+    becomes None, which is no id, and does not hide the id beside it."""
+    try:
+        return int(text)
+    except ValueError:
+        return None
+
+
 def _lenient_id(line: bytes):
     """The id of a server document that _parse refused only for its
-    duplicate keys, so the request it answers can be failed closed by
-    id rather than by guesswork. _NO_ID when there is none."""
+    duplicate keys (or a number it cannot carry), so the request it answers
+    can be failed closed by id rather than by guesswork. _NO_ID when there
+    is none."""
     try:
-        obj = json.loads(line.decode("utf-8"))
+        obj = json.loads(line.decode("utf-8"), parse_int=_int_or_none)
     except (ValueError, RecursionError):
         return _NO_ID
     if isinstance(obj, dict) and "id" in obj:
@@ -881,7 +957,8 @@ def _salvage_id(line: bytes):
     an integer. Otherwise _NO_ID (the refusal then carries a null id)."""
     try:
         obj = json.loads(line.decode("utf-8"),
-                         object_pairs_hook=_no_duplicate_keys)
+                         object_pairs_hook=_no_duplicate_keys,
+                         parse_int=_int_or_none)
     except (ValueError, RecursionError):
         return _NO_ID
     rid = obj.get("id") if isinstance(obj, dict) else None
@@ -1261,6 +1338,27 @@ def _finite_float(text: str) -> float:
     return value
 
 
+# Python 3.10.7 and later refuse to turn more than 4300 digits into an int (a
+# ValueError, which _parse took for bad JSON); older ones read any length, at a
+# cost that grows with its square. The jail's limit is the same on every
+# version, and a longer integer is a number it cannot carry, like 1e999.
+_MAX_INT_DIGITS = 4300
+
+
+def _bounded_int(text: str) -> int:
+    """parse_int hook: see _MAX_INT_DIGITS."""
+    digits = len(text) - (text[:1] == "-")
+    if digits > _MAX_INT_DIGITS:
+        raise _Unrepresentable(
+            f"integer of more than {_MAX_INT_DIGITS} digits")
+    try:
+        return int(text)
+    except ValueError:      # a lower limit has been set for this Python
+        raise _Unrepresentable(
+            f"integer of {digits} digits (more than this Python reads)"
+        ) from None
+
+
 def _parse(line: bytes):
     """Decode one wire line. Returns (obj, None, "") on success,
     (None, None, "") for a blank line, else (None, rpc_code, text)."""
@@ -1275,7 +1373,7 @@ def _parse(line: bytes):
     try:
         obj = json.loads(body, object_pairs_hook=_no_duplicate_keys,
                          parse_constant=_no_constants,
-                         parse_float=_finite_float)
+                         parse_float=_finite_float, parse_int=_bounded_int)
     except (_DuplicateKey, _Unrepresentable) as e:
         # well-formed JSON that the jail will not carry: its id is known
         return None, INVALID_REQUEST, str(e)
@@ -1291,55 +1389,203 @@ def _parse(line: bytes):
     return obj, None, ""
 
 
+def _stop_signals() -> list:
+    """The signals that mean "stop now, tidily": SIGTERM wherever it can be
+    sent, SIGHUP when the terminal goes away (POSIX), SIGBREAK, Ctrl-Break,
+    on Windows - which has no other. Ctrl-C (SIGINT) stays Python's
+    KeyboardInterrupt: it stops the server at once."""
+    return [getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGBREAK")
+            if hasattr(signal, name)]
+
+
+def _signal_name(signum: int) -> str:
+    try:
+        return signal.Signals(signum).name
+    except ValueError:
+        return f"signal {signum}"
+
+
+class _StopSignals:
+    """While active, the signals of _stop_signals() do not kill the jail: the
+    first is put on the proxy's queue, where the loop ends the session the
+    way the client leaving does (_Proxy.serve); the second is no longer
+    waited for: the server is killed and the jail ends at once. The handler
+    does nothing else, since it runs between two statements of the loop: the
+    queue is a SimpleQueue because its put() may be called from there. Only
+    the main thread can take a signal, so on any other this does nothing; a
+    signal that was being ignored (nohup) still is."""
+
+    def __init__(self):
+        self.signum = None
+        self._q = None
+        self._proc = None
+        self._saved: dict = {}
+
+    def __enter__(self):
+        if threading.current_thread() is threading.main_thread():
+            for sig in _stop_signals():
+                try:
+                    if signal.getsignal(sig) == signal.SIG_IGN:
+                        continue
+                    self._saved[sig] = signal.signal(sig, self._on_signal)
+                except (OSError, ValueError):
+                    pass
+        return self
+
+    def __exit__(self, *exc) -> None:
+        for sig, old in self._saved.items():
+            try:
+                signal.signal(sig, signal.SIG_DFL if old is None else old)
+            except (OSError, ValueError):
+                pass
+        self._saved.clear()
+
+    def attach(self, q, proc) -> None:
+        """The proxy's queue and the server, once there are any; a signal
+        that came before is told now."""
+        self._q, self._proc = q, proc
+        if self.signum is not None:
+            q.put(("signal", self.signum))
+
+    def _on_signal(self, signum, frame) -> None:
+        if self.signum is not None:
+            self._hard_exit(signum)
+            return
+        self.signum = signum
+        if self._q is not None:
+            self._q.put(("signal", signum))
+
+    def _hard_exit(self, signum: int) -> None:
+        if self._proc is not None:
+            try:
+                self._proc.kill()
+            except OSError:
+                pass
+        os._exit(128 + signum)
+
+
 class _Pending:
     """Requests forwarded to the server that still owe a response, keyed
-    by exact-type id. Duplicate ids queue up FIFO."""
+    by exact-type id. Duplicate ids queue up FIFO.
+
+    The loop asks how many are owed and when the next falls due on every
+    message, so neither is worked out by walking them all (with thousands in
+    flight that was quadratic): a count is kept, and the deadlines sit in a
+    heap. A request answered before its deadline is not searched for in the
+    heap - it is flagged, and its entry is dropped when it comes to the top,
+    or sooner, when the dead entries outnumber the live ones."""
 
     def __init__(self):
         self._by_key: dict[str, collections.deque] = {}
+        self._count = 0
+        self._heap: list = []           # (deadline, serial, key, entry)
+        self._serial = itertools.count()
 
     def add(self, req_id, method: str, deadline: float | None,
             call=None) -> None:
-        self._by_key.setdefault(_id_key(req_id), collections.deque()).append(
-            {"id": req_id, "method": method, "deadline": deadline,
-             "call": call})
+        key = _id_key(req_id)
+        entry = {"id": req_id, "method": method, "deadline": deadline,
+                 "call": call, "gone": False}
+        self._by_key.setdefault(key, collections.deque()).append(entry)
+        self._count += 1
+        if deadline is not None:
+            heapq.heappush(self._heap,
+                           (deadline, next(self._serial), key, entry))
+
+    def peek(self, req_id) -> dict | None:
+        """The entry pop() would return, left where it is."""
+        dq = self._by_key.get(_id_key(req_id))
+        return dq[0] if dq else None
 
     def pop(self, req_id) -> dict | None:
         key = _id_key(req_id)
         dq = self._by_key.get(key)
         if not dq:
             return None
-        entry = dq.popleft()
-        if not dq:
-            del self._by_key[key]
+        entry = dq[0]
+        self._remove(key, entry)
         return entry
 
+    def _remove(self, key: str, entry: dict) -> None:
+        """Take one entry out (it is answered, or timed out, or expired)."""
+        dq = self._by_key[key]
+        if dq[0] is entry:
+            dq.popleft()
+        else:                           # not the oldest of its id: rare
+            for i, e in enumerate(dq):
+                if e is entry:
+                    del dq[i]
+                    break
+        if not dq:
+            del self._by_key[key]
+        entry["gone"] = True
+        self._count -= 1
+        if len(self._heap) > 2 * self._count + 64:
+            self._heap = [h for h in self._heap if not h[3]["gone"]]
+            heapq.heapify(self._heap)
+
     def __len__(self) -> int:
-        return sum(len(dq) for dq in self._by_key.values())
+        return self._count
+
+    def _soonest(self):
+        """The heap's first live item, dead ones dropped on the way."""
+        heap = self._heap
+        while heap and heap[0][3]["gone"]:
+            heapq.heappop(heap)
+        return heap[0] if heap else None
 
     def expired(self, now: float) -> list[dict]:
+        """Take out, and return in the order they fell due, the requests
+        whose deadline has passed."""
         out = []
-        for key in list(self._by_key):
-            dq = self._by_key[key]
-            keep = collections.deque()
-            for e in dq:
-                (out if e["deadline"] is not None and e["deadline"] <= now
-                 else keep).append(e)
-            if keep:
-                self._by_key[key] = keep
-            else:
-                del self._by_key[key]
-        return out
+        while True:
+            item = self._soonest()
+            if item is None or item[0] > now:
+                return out
+            heapq.heappop(self._heap)
+            self._remove(item[2], item[3])
+            out.append(item[3])
 
     def drain(self) -> list[dict]:
         out = [e for dq in self._by_key.values() for e in dq]
+        for e in out:
+            e["gone"] = True
         self._by_key.clear()
+        self._heap = []
+        self._count = 0
         return out
 
     def next_deadline(self) -> float | None:
-        ds = [e["deadline"] for dq in self._by_key.values() for e in dq
-              if e["deadline"] is not None]
-        return min(ds) if ds else None
+        item = self._soonest()
+        return item[0] if item is not None else None
+
+
+class _Cancelled:
+    """The ids of requests the client has cancelled, each kept until the one
+    reply a server may still send for it: MCP lets the receiver of a
+    cancellation answer anyway, and the answer is to be ignored. Bounded, the
+    oldest forgotten first, so a server that never answers a cancelled
+    request cannot make it grow."""
+
+    def __init__(self, limit: int = 1024):
+        self._limit = limit
+        self._keys: "collections.OrderedDict[str, None]" = (
+            collections.OrderedDict())
+
+    def add(self, key: str) -> None:
+        self._keys.pop(key, None)
+        self._keys[key] = None
+        while len(self._keys) > self._limit:
+            self._keys.popitem(last=False)
+
+    def discard(self, key: str) -> None:
+        self._keys.pop(key, None)
+
+    def __contains__(self, key) -> bool:
+        return key in self._keys
+
+    def __len__(self) -> int:
+        return len(self._keys)
 
 
 def _call_succeeded(msg: dict) -> bool:
@@ -1356,10 +1602,11 @@ class _Proxy:
     from a single queue and is the only writer to either side."""
 
     def __init__(self, proc, client_in, client_out, timeout: float | None,
-                 pol: dict | None, observer=None, grace: float = DEFAULT_GRACE):
+                 pol: dict | None, observer=None, grace: float = DEFAULT_GRACE,
+                 stop: "_StopSignals | None" = None):
         self.proc = proc
         self.grace = grace
-        self.q: "queue.Queue" = queue.Queue()
+        self.q: "queue.SimpleQueue" = queue.SimpleQueue()
         self.client = _Writer(client_out)
         self.timeout = timeout if timeout and timeout > 0 else None
         self.server = _ServerInput(proc.stdin, self.timeout,
@@ -1367,11 +1614,16 @@ class _Proxy:
         self.pol = pol
         self.observer = observer
         self.pending = _Pending()
+        self._cancelled = _Cancelled()
         self._client_in = _binary_in(client_in)
         # why the server is lost (it exited, closed its input, stopped
         # reading it), and how many requests it left unanswered past --timeout
         self.lost: "str | None" = None
         self.timed_out = 0
+        # the signal that told the jail to stop, once one has
+        self.signalled: "int | None" = None
+        if stop is not None:
+            stop.attach(self.q, proc)
 
     # -- helpers ----------------------------------------------------------
 
@@ -1539,10 +1791,47 @@ class _Proxy:
                 return
             if self.observer is not None and has_id and mkey == "tools/call":
                 call = (name, targs)  # recorded once the server succeeds
+        if (mkey == "notifications/cancelled" and not has_id
+                and self._cancels_initialize(msg)):
+            # MCP: a client must not cancel initialize. Not passed on, so the
+            # handshake completes as it would have.
+            self._refuse("initialize cannot be cancelled", reply=False,
+                         subject=msg, method=method)
+            return
         if not self._forward(msg, req_id, has_id):
             return
         if has_id:
             self.pending.add(req_id, mkey, self._deadline(), call=call)
+            self._cancelled.discard(_id_key(req_id))    # the id is in use again
+        elif mkey == "notifications/cancelled":
+            self._stop_waiting_for(msg)
+
+    @staticmethod
+    def _cancelled_id(msg: dict):
+        """The request id a notifications/cancelled names, or _NO_ID when it
+        names none the jail could be waiting for (no params, no requestId, or
+        one that is not a string or a number)."""
+        params = msg.get("params")
+        rid = params.get("requestId") if isinstance(params, dict) else None
+        if isinstance(rid, bool) or not isinstance(rid, (str, int, float)):
+            return _NO_ID
+        return rid
+
+    def _cancels_initialize(self, msg: dict) -> bool:
+        rid = self._cancelled_id(msg)
+        entry = None if rid is _NO_ID else self.pending.peek(rid)
+        return entry is not None and entry["method"] == "initialize"
+
+    def _stop_waiting_for(self, msg: dict) -> None:
+        """The cancel has gone to the server. The receiver need not answer a
+        cancelled request (the TypeScript and Python SDK servers do not), so
+        the jail stops timing it: it is no longer owed, and a reply that comes
+        anyway is dropped (see _on_server_message). A cancel that names no
+        request pending here - unknown, already answered, odd - is just passed
+        on."""
+        rid = self._cancelled_id(msg)
+        if rid is not _NO_ID and self.pending.pop(rid) is not None:
+            self._cancelled.add(_id_key(rid))
 
     # -- server -> client ---------------------------------------------------
 
@@ -1626,6 +1915,12 @@ class _Proxy:
             return False
         entry = self.pending.pop(msg.get("id"))
         if entry is None:
+            key = _id_key(msg.get("id"))
+            if key in self._cancelled:
+                # the reply a cancelled request was allowed to get: the client
+                # was to ignore it, so it is not passed on and not remarked on
+                self._cancelled.discard(key)
+                return False
             # Late (already timed out) or unsolicited: the client already
             # has its answer for this id, a second one would confuse it.
             self._log(f"dropping response with unknown id {msg.get('id')!r}")
@@ -1756,18 +2051,28 @@ class _Proxy:
                 tag, line = self.q.get(timeout=min(deadline - now, 0.05))
             except queue.Empty:
                 continue
+            if tag == "signal":     # told to stop while leaving: no more waiting
+                self._note_signal(line)
+                return
             if tag == "server":     # not the writer's receipts
                 if line is None:
                     out_open = False
                 else:
                     self._handle(self._on_server_line, line)
 
+    def _note_signal(self, signum: int) -> None:
+        self.signalled = signum
+        self._log(f"{_signal_name(signum)} received: ending the session")
+
     def serve(self) -> int:
         """Relay until the client is done and everything is answered, then
-        wind the server down (see _wind_down), or until the server is lost.
+        wind the server down (see _wind_down), or until the server is lost,
+        or the jail is told to stop (SIGTERM, SIGHUP, Ctrl-Break): the client
+        is not read from any more and the server is wound down the same way.
         Returns 0 for a clean session, EXIT_SERVER when the server exited or
         closed its pipes while the client was still talking to it, stopped
-        reading its input, or left a request unanswered past --timeout."""
+        reading its input, or left a request unanswered past --timeout, and
+        128 plus the number of the signal that stopped it."""
         _Reader(self._client_in, "client", self.q).start()
         _Reader(self.proc.stdout, "server", self.q).start()
         self.server.start()
@@ -1784,7 +2089,8 @@ class _Proxy:
                     break
                 try:
                     tag, line = self.q.get(
-                        timeout=None if wait is None else min(wait, _MAX_BLOCK))
+                        timeout=_IDLE_WAKE if wait is None
+                        else min(wait, _IDLE_WAKE))
                 except queue.Empty:
                     continue
                 if tag == "client":
@@ -1796,6 +2102,11 @@ class _Proxy:
                     if line is not None:    # writing failed: its stdin is gone
                         self._lose(f"closed its input ({line})", "server closed")
                         break
+                elif tag == "signal":
+                    self._note_signal(line)
+                    if not self.timed_out and self.grace > 0:
+                        self._wind_down()
+                    break
                 else:
                     if line is None:
                         # the server's stdout closed: it exited, or shut its
@@ -1810,9 +2121,15 @@ class _Proxy:
         except (OSError, ValueError) as e:  # a pipe went away under us
             self._log(f"transport closed: {e}")
         finally:
+            if self.timed_out:
+                s = "" if self.timed_out == 1 else "s"
+                self._log(f"server did not answer {self.timed_out} "
+                          f"request{s} within {self.timeout:g}s")
             if self.lost is not None:
                 self._log(f"server {self.lost}")
             self._end_input()
+        if self.signalled is not None:
+            return 128 + self.signalled
         return EXIT_SERVER if (self.lost is not None or self.timed_out) else 0
 
 
@@ -1845,17 +2162,23 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     except (json.JSONDecodeError, re.error, ValueError) as e:
         sys.stderr.write(f"mcp-jail: bad policy: {e}\n")
         return 2
-    try:
-        proc = _spawn(server_cmd)
-    except ServerNotFound as e:
-        sys.stderr.write(f"mcp-jail: server command not found: {e} "
-                         f"(not on PATH)\n")
+    client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
+    closed = _missing_streams(client_in, client_out)
+    if closed:
+        _say(f"mcp-jail: {closed}")
         return 2
-    try:
-        return _Proxy(proc, stdin or sys.stdin, stdout or sys.stdout,
-                      timeout, pol, grace=grace).serve()
-    finally:
-        _stop(proc)
+    with _StopSignals() as stop:
+        try:
+            proc = _spawn(server_cmd)
+        except ServerNotFound as e:
+            sys.stderr.write(f"mcp-jail: server command not found: {e} "
+                             f"(not on PATH)\n")
+            return 2
+        try:
+            return _Proxy(proc, client_in, client_out, timeout, pol,
+                          grace=grace, stop=stop).serve()
+        finally:
+            _stop(proc)
 
 
 # ---------------------------------------------------------------------------
@@ -2064,13 +2387,13 @@ class _Session:
         while True:
             if self.closed:
                 return ("closed",)
-            remaining = _MAX_BLOCK
+            remaining = _IDLE_WAKE
             if deadline is not None:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return ("timeout",)
             try:
-                tag, line = self.q.get(timeout=min(remaining, _MAX_BLOCK))
+                tag, line = self.q.get(timeout=min(remaining, _IDLE_WAKE))
             except queue.Empty:
                 continue            # the deadline, if any, is checked above
             if tag == "input":
@@ -2238,28 +2561,42 @@ def learn(server_cmd: list[str], script: str | None = None,
             print(f"mcp-jail learn: cannot create the directory for "
                   f"--out {out}: {e}", file=sys.stderr)
             return 2
-    rec = _Recorder()
-    try:
-        proc = _spawn(server_cmd)
-    except ServerNotFound as e:
-        print(f"mcp-jail learn: server command not found: {e} "
-              f"(not on PATH)", file=sys.stderr)
+    client_in, client_out = stdin or sys.stdin, stdout or sys.stdout
+    if script is None:
+        closed = _missing_streams(client_in, client_out)
+    elif not out and client_out is None:
+        closed = ("standard output is closed and no --out was given (the "
+                  "policy has nowhere to go)")
+    else:
+        closed = None
+    if closed:
+        _say(f"mcp-jail learn: {closed}")
         return 2
-    failure: str | None = None
-    try:
-        if script is not None:
-            failure = _learn_from_script(proc, calls, timeout, rec)
-        else:
-            proxy = _Proxy(proc, stdin or sys.stdin, stdout or sys.stdout,
-                           timeout, None, observer=rec, grace=grace)
-            try:
-                proxy.serve()
-            except KeyboardInterrupt:
-                pass
-            if proxy.lost is not None:
-                failure = f"the server {proxy.lost} during the session"
-    finally:
-        _stop(proc)
+    rec = _Recorder()
+    # a live session ends on SIGTERM / SIGHUP as it does on Ctrl-C, with the
+    # policy; a script is driven by this thread alone and has no loop to tell
+    with (_StopSignals() if script is None else contextlib.nullcontext()) as stop:
+        try:
+            proc = _spawn(server_cmd)
+        except ServerNotFound as e:
+            print(f"mcp-jail learn: server command not found: {e} "
+                  f"(not on PATH)", file=sys.stderr)
+            return 2
+        failure: str | None = None
+        try:
+            if script is not None:
+                failure = _learn_from_script(proc, calls, timeout, rec)
+            else:
+                proxy = _Proxy(proc, client_in, client_out, timeout, None,
+                               observer=rec, grace=grace, stop=stop)
+                try:
+                    proxy.serve()
+                except KeyboardInterrupt:
+                    pass
+                if proxy.lost is not None:
+                    failure = f"the server {proxy.lost} during the session"
+        finally:
+            _stop(proc)
     policy = generate_policy(rec.tools, rec.calls)
     text = json.dumps(policy, indent=2)
     code = 0

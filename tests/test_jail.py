@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import stat
 import subprocess
 import sys
@@ -3841,6 +3842,60 @@ class TestExitCodes(ProxyCase):
         self.assertEqual(code, 0)
         self.assertIn("result", resps[0])
 
+    def run_with_stderr(self, server_src, requests, timeout=5):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, resps = self.run_session(server_src, requests, timeout)
+        return code, resps, err.getvalue()
+
+    def test_a_timeout_says_so_on_stderr_once(self):
+        # R6-4e: exit 3 and not a word from the jail
+        code, resps, err = self.run_with_stderr(
+            FAKE_HANG, [call(1, "slow", {}), call(2, "slow", {})], timeout=1)
+        self.assertEqual(code, 3)
+        self.assertEqual([r["error"]["message"] for r in resps],
+                         ["server timed out"] * 2)
+        self.assertEqual(err.splitlines(), [
+            "mcp-jail: server did not answer 2 requests within 1s"])
+
+    def test_one_request_that_timed_out_is_one_request(self):
+        code, resps, err = self.run_with_stderr(
+            FAKE_HANG, [call(1, "slow", {})], timeout=1)
+        self.assertEqual(code, 3)
+        self.assertEqual(err.splitlines(), [
+            "mcp-jail: server did not answer 1 request within 1s"])
+
+    def test_a_request_the_server_answered_late_is_not_a_timeout(self):
+        code, resps, err = self.run_with_stderr(
+            FAKE_SLOW, [call(1, "t", {"delay": 0.5})], timeout=10)
+        self.assertEqual((code, err), (0, ""))
+
+    def test_a_server_that_dies_when_asked_something_says_so_and_exits_3(self):
+        # what a wrapper can rely on to tell a server that died on start-up
+        code, resps, err = self.run_with_stderr(
+            "import sys\nsys.exit(1)\n", [call(1, "read_file", {})])
+        self.assertEqual(code, 3)
+        self.assertIn("exit status 1", err)
+
+    def test_a_client_that_asks_nothing_is_a_clean_session_whatever_became_of_the_server(self):
+        # README: there was nothing to fail. (A wrapper that wants to know
+        # whether a server starts sends it `initialize`.)
+        for requests in ([], [{"jsonrpc": "2.0",
+                               "method": "notifications/initialized"}]):
+            with self.subTest(requests=len(requests)):
+                code, resps, err = self.run_with_stderr(
+                    "import sys\nsys.exit(1)\n", requests)
+                self.assertEqual((code, resps), (0, []))
+
+    def test_readme_says_what_the_exit_status_tells_a_wrapper(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split()).lower()
+        for needle in ("a client that sends nothing is asking nothing of the "
+                       "server", "send it `initialize`"):
+            self.assertTrue(needle in readme, f"the README does not say {needle}")
+        self.assertFalse("tell a server that died on start-up from a session "
+                         "that ran" in readme, "the old, untrue sentence")
+
     def test_the_exit_code_reaches_the_real_entry_point(self):
         srv = self.srv("import sys\nsys.exit(0)\n", "gone.py")
         pol = write_policy(self.tmp, ALLOW_ALL)
@@ -4368,6 +4423,1371 @@ class TestSecondsOptions(ProxyCase):
                                 stdin=io.BytesIO(b""), stdout=io.BytesIO())
         self.assertEqual(code, 2)
         self.assertIn("bad policy", err.getvalue())
+
+
+class TestDenyWildcard(ProxyCase):
+    """R6-1: the README and the starter policy say `*` = all, deny wins - and
+    deny_tools had no `*` case. {"allow_tools": ["*"], "deny_tools": ["*"]}
+    let every call through and hid no tool. Every deny list honours `*` now;
+    a `*` that a list cannot honour is refused when the policy loads, instead
+    of being read as a name that matches nothing."""
+
+    STAR_POLICIES = [
+        {"deny_tools": ["*"]},
+        {"allow_tools": [], "deny_tools": ["*"]},
+        {"allow_tools": ["*"], "deny_tools": ["*"]},
+        {"allow_tools": ["read_file"], "deny_tools": ["*"]},    # deny wins
+        {"allow_tools": ["*"], "deny_tools": ["read_file", "*"]},
+        {"allow_tools": ["*"], "deny_tools": ["\uff0a"]},       # NFKC: a *
+        {"allow_tools": ["*"], "deny_tools": [" * "]},
+        {"allow_tools": ["*"], "deny_tools": ["*\u200b"]},      # zero-width
+    ]
+
+    def test_a_lone_star_in_deny_tools_denies_every_tool(self):
+        for raw in self.STAR_POLICIES:
+            pol = compiled(raw)
+            for tool in ("read_file", "delete_all", "x", "Read_File"):
+                with self.subTest(policy=raw, tool=tool):
+                    ok, reason = jail_mod.tool_allowed(pol, tool, {})
+                    self.assertFalse(ok)
+                    self.assertIn("denied by policy", reason)
+                    self.assertFalse(jail_mod.tool_visible(pol, tool)[0])
+
+    def test_a_deny_list_that_is_an_object_counts_too(self):
+        pol = compiled({"allow_tools": ["*"], "deny_tools": {"*": "everything"}})
+        self.assertFalse(jail_mod.tool_allowed(pol, "read_file", {})[0])
+
+    def test_other_deny_lists_and_an_ordinary_policy_are_unchanged(self):
+        pol = compiled({"allow_tools": ["*"], "deny_tools": ["delete_all"]})
+        self.assertTrue(jail_mod.tool_allowed(pol, "read_file", {})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "delete_all", {})[0])
+        pol = compiled({"allow_tools": ["*"], "deny_tools": []})
+        self.assertTrue(jail_mod.tool_allowed(pol, "read_file", {})[0])
+
+    def test_hide_denied_hides_every_tool(self):
+        pol = compiled({"allow_tools": ["*"], "deny_tools": ["*"],
+                        "hide_denied": True})
+        result = {"tools": [{"name": "read_file"}, {"name": "delete_all"}],
+                  "nextCursor": "c"}
+        jail_mod.filter_tools_list(pol, result)
+        self.assertEqual(result, {"tools": [], "nextCursor": "c"})
+
+    def test_end_to_end_the_server_is_never_asked(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_RECORDER, "rec.py")
+        pol = write_policy(self.tmp, {"allow_tools": ["*"],
+                                      "deny_tools": ["*"],
+                                      "hide_denied": False})
+        resps = drive_jail(pol, srv, [call(1, "read_file", {}),
+                                      call(2, "delete_all", {}),
+                                      call(3, "x", {"a": 1})],
+                           server_args=[log])
+        self.assertEqual(sorted(r["id"] for r in resps), [1, 2, 3])
+        for r in resps:
+            self.assertEqual(r["error"]["code"], -32602, r)
+            self.assertIn("denied by policy", r["error"]["message"])
+        seen = ""
+        if os.path.exists(log):
+            with open(log, encoding="utf-8") as f:
+                seen = f.read()
+        self.assertNotIn("tools/call", seen)
+        with open(jail_mod.AUDIT_LOG, encoding="utf-8") as f:
+            decisions = [json.loads(l)["decision"] for l in f if l.strip()]
+        self.assertEqual(decisions, ["deny", "deny", "deny"])
+
+    def test_end_to_end_tools_list_comes_back_empty(self):
+        pol = write_policy(self.tmp, {"allow_tools": ["*"], "deny_tools": ["*"],
+                                      "hide_denied": True})
+        resps = drive_jail(pol, self.server, [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}])
+        self.assertEqual(resps[0]["result"]["tools"], [])
+
+    def test_resources_and_prompts_follow_when_they_are_policed(self):
+        pol = write_policy(self.tmp, {
+            "allow_tools": ["*"], "deny_tools": ["*"], "hide_denied": False,
+            "policed_methods": ["tools/call", "prompts/get", "resources/read"]})
+        resps = drive_jail(pol, self.server, [
+            {"jsonrpc": "2.0", "id": 1, "method": "prompts/get",
+             "params": {"name": "p"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "resources/read",
+             "params": {"uri": "file:///a.txt"}},
+            {"jsonrpc": "2.0", "id": 3, "method": "resources/list"}])
+        by_id = {r["id"]: r for r in resps}
+        self.assertIn("denied by policy", by_id[1]["error"]["message"])
+        self.assertIn("denied by policy", by_id[2]["error"]["message"])
+        self.assertIn("result", by_id[3])   # not policed: relayed as ever
+
+    def test_a_star_in_deny_methods_refuses_every_method(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_RECORDER, "rec.py")
+        pol = write_policy(self.tmp, {"allow_tools": ["*"],
+                                      "deny_methods": ["*"]})
+        resps = drive_jail(pol, srv, [
+            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {"jsonrpc": "2.0", "method": "notifications/initialized"},
+            call(2, "read_file", {}),
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"}], server_args=[log])
+        self.assertEqual(sorted(r["id"] for r in resps), [1, 2, 3])
+        for r in resps:
+            self.assertEqual(r["error"]["code"], -32601, r)
+        seen = ""
+        if os.path.exists(log):
+            with open(log, encoding="utf-8") as f:
+                seen = f.read()
+        self.assertEqual(seen, "")      # nothing, notification included
+
+    def test_a_star_a_list_cannot_honour_is_refused_when_the_policy_loads(self):
+        cases = [
+            ({"deny_tools": ["delete_*"]}, "deny_tools", "delete_*"),
+            ({"allow_tools": ["*"], "deny_tools": ["file:///srv/*"]},
+             "deny_tools", "file:///srv/*"),
+            ({"deny_tools": ["delete_\uff0a"]}, "deny_tools", "delete_"),
+            ({"arg_rules": {"*": {"deny": ["x"]}}}, "arg_rules", "'*'"),
+            ({"arg_rules": {"read_*": {"deny": ["x"]}}}, "arg_rules", "read_*"),
+            ({"policed_methods": ["*"]}, "policed_methods", "'*'"),
+            ({"policed_methods": ["resources/*"]}, "policed_methods",
+             "resources/*"),
+        ]
+        for raw, key, entry in cases:
+            with self.subTest(policy=raw):
+                with self.assertRaises(ValueError) as cm:
+                    jail_mod.compile_policy(json.loads(json.dumps(raw)))
+                msg = str(cm.exception)
+                self.assertIn(key, msg)
+                self.assertIn(entry, msg)
+                self.assertNotIn("\n", msg)
+        # what is meant stays valid
+        for fine in ({"deny_tools": ["*"]},
+                     {"deny_tools": ["delete_all", "*"]},
+                     {"deny_methods": ["*", "resources/*"]},
+                     {"arg_rules": {"read_file": {"allow": "*"}}},
+                     {"policed_methods": ["prompts/get"]},
+                     jail_mod.default_policy(),
+                     jail_mod.generate_policy(["a"], [("a", {"x": 1})])):
+            jail_mod.compile_policy(json.loads(json.dumps(fine)))
+
+    def test_a_refused_star_ends_in_exit_2_and_never_starts_the_server(self):
+        started = os.path.join(self.tmp, "started")
+        for raw in ({"deny_tools": ["delete_*"]},
+                    {"arg_rules": {"*": {"deny": ["x"]}}},
+                    {"policed_methods": ["resources/*"]}):
+            with self.subTest(policy=raw):
+                pol = write_policy(self.tmp, raw)
+                proc = subprocess.run(
+                    [sys.executable, "-m", "mcp_jail", "--policy", pol, "--",
+                     sys.executable, "-c", "open(%r, 'w').close()" % started],
+                    input=b"", capture_output=True, env=child_env(),
+                    cwd=self.tmp, timeout=60)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertEqual(len(proc.stderr.splitlines()), 1, proc.stderr)
+                self.assertIn(b"bad policy", proc.stderr)
+                self.assertFalse(os.path.exists(started))
+
+    def test_readme_and_the_starter_policy_say_what_a_star_is(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())
+        for needle in ('`"deny_tools": ["*"]` refuses every call and hides '
+                       'every tool',
+                       "`*` is a wildcard only on its own"):
+            self.assertTrue(needle in readme, f"the README does not say {needle}")
+        self.assertIn("'*' = all; deny wins",
+                      jail_mod.default_policy()["_comment"])
+
+
+# An MCP server in the way of the TypeScript and Python SDK ones: told that a
+# request is cancelled, it drops it and sends no reply (mode "late": it
+# answers anyway, the race the spec allows; mode "eof": it ignores the cancel
+# and answers as it leaves). A tools/call, or any request that says "hold", is
+# a slow one that is never answered; "initialize" answers after a moment.
+# Every line it receives goes to <argv[1]>.seen; when its input ends it
+# flushes its state for half a second and writes <argv[1]>, then leaves.
+FAKE_CANCELLABLE = r"""
+import json, sys, time
+marker, mode = sys.argv[1], (sys.argv[2] if len(sys.argv) > 2 else "silent")
+seen = open(marker + ".seen", "a", encoding="utf-8")
+held = {}
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+for line in sys.stdin:
+    seen.write(line); seen.flush()
+    m = json.loads(line)
+    if m.get("method") == "notifications/cancelled":
+        p = m.get("params")
+        rid = p.get("requestId") if isinstance(p, dict) else None
+        if type(rid) in (int, str):
+            if mode == "late" and rid in held:
+                send({"jsonrpc": "2.0", "id": rid, "result": {"late": True}})
+            if mode != "eof":
+                held.pop(rid, None)
+        continue
+    if "id" not in m:
+        continue
+    if m.get("method") == "tools/call" or (m.get("params") or {}).get("hold"):
+        held[m["id"]] = m
+        continue
+    if m.get("method") == "initialize":
+        time.sleep(0.3)
+    send({"jsonrpc": "2.0", "id": m["id"], "result": {"ok": True}})
+if mode == "eof":
+    for rid in list(held):
+        send({"jsonrpc": "2.0", "id": rid, "result": {"late": True}})
+time.sleep(0.5)
+open(marker, "w").write("clean shutdown")
+"""
+
+
+def cancel(request_id, **params):
+    return {"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": dict(requestId=request_id, reason="user", **params)}
+
+
+def ping(req_id):
+    return {"jsonrpc": "2.0", "id": req_id, "method": "ping"}
+
+
+class PipedClient:
+    """The jail, run in this process, with a client that writes when it
+    likes: unlike drive_rc, time passes between its messages."""
+
+    def __init__(self, policy_path, server_cmd, timeout=30.0):
+        r, w = os.pipe()
+        self._to_jail = os.fdopen(w, "wb", buffering=0)
+        self.out = io.BytesIO()
+        self.code = []
+        stdin = os.fdopen(r, "rb")
+
+        def target():
+            try:
+                self.code.append(jail_mod.run(policy_path, server_cmd,
+                                              timeout=timeout, stdin=stdin,
+                                              stdout=self.out))
+            finally:
+                stdin.close()
+
+        self.thread = threading.Thread(target=target, daemon=True)
+        self.thread.start()
+
+    def send(self, obj):
+        self._to_jail.write(json.dumps(obj).encode("utf-8") + b"\n")
+
+    def finish(self, join=30):
+        self._to_jail.close()
+        self.thread.join(join)
+        if self.thread.is_alive():
+            raise AssertionError("proxy did not finish (hung?)")
+        return self.code[0], [json.loads(l) for l in self.out.getvalue().split(b"\n")
+                              if l.strip()]
+
+
+class TestCancellation(ProxyCase):
+    """R6-2: `notifications/cancelled` asks the receiver to stop a request,
+    and the TypeScript and Python SDK servers then send no reply to it. The
+    jail went on waiting for that reply, so a healthy session ended with a
+    bogus `-32603 server timed out` to the client, exit 3, no --grace
+    shutdown (the server was killed in the middle of flushing its state), and
+    a session that outlived --timeout. The cancelled id is not waited for any
+    more; a reply that comes anyway (the spec allows the race) is dropped."""
+
+    def server_cmd(self, mode="silent"):
+        self.marker = os.path.join(self.tmp, "state")
+        return [sys.executable, self.srv(FAKE_CANCELLABLE, "cancellable.py"),
+                self.marker, mode]
+
+    def seen(self) -> list:
+        path = self.marker + ".seen"
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(l) for l in f if l.strip()]
+
+    def test_a_cancelled_call_is_not_timed_out_and_the_session_ends_clean(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        started = time.monotonic()
+        with redirect_stderr(err):
+            code, raw = drive_rc(pol, self.server_cmd(), [
+                ping(1), call(5, "slow", {}), cancel(5)], timeout=8.0)
+        took = time.monotonic() - started
+        msgs = [json.loads(l) for l in raw]
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual([m["id"] for m in msgs], [1], msgs)
+        self.assertLess(took, 6.0, "the session waited out --timeout")
+        self.assertNotIn("timed out", err.getvalue())
+        # the server was told, and was given its time to finish (--grace)
+        self.assertEqual([m.get("method") for m in self.seen()],
+                         ["ping", "tools/call", "notifications/cancelled"])
+        self.assertTrue(os.path.exists(self.marker), "the server was cut short")
+
+    def test_the_session_goes_on_past_the_timeout_after_a_cancel(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            client = PipedClient(pol, self.server_cmd(), timeout=1.0)
+            client.send(ping(1))
+            client.send(call(5, "slow", {}))
+            client.send(cancel(5))
+            time.sleep(2.0)                     # twice --timeout
+            client.send(ping(2))
+            code, msgs = client.finish()
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual([m["id"] for m in msgs], [1, 2], msgs)
+        self.assertTrue(all("result" in m for m in msgs))
+        self.assertTrue(os.path.exists(self.marker))
+
+    def test_a_late_reply_for_a_cancelled_call_is_dropped_quietly(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            client = PipedClient(pol, self.server_cmd("late"), timeout=5.0)
+            client.send(call(5, "slow", {}))
+            client.send(cancel(5))
+            time.sleep(0.5)                     # the late reply has come
+            client.send(ping(2))
+            code, msgs = client.finish()
+        self.assertEqual(code, 0, err.getvalue())
+        self.assertEqual([m["id"] for m in msgs], [2], msgs)  # nothing for 5
+        self.assertEqual(err.getvalue(), "")                  # and no fuss
+        with open(jail_mod.AUDIT_LOG, encoding="utf-8") if os.path.exists(
+                jail_mod.AUDIT_LOG) else io.StringIO() as f:
+            self.assertEqual([l for l in f if "rejected" in l], [])
+
+    def test_a_reply_that_comes_as_the_server_leaves_is_dropped_quietly(self):
+        # the server ignores the cancel and answers when its input ends,
+        # which is during --grace: still a reply to a cancelled request
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, raw = drive_rc(pol, self.server_cmd("eof"), [
+                call(5, "slow", {}), cancel(5)], timeout=8.0)
+        self.assertEqual((code, raw), (0, []))
+        self.assertEqual(err.getvalue(), "")
+        self.assertTrue(os.path.exists(self.marker), "the server was cut short")
+
+    def test_a_second_late_reply_is_still_logged_as_unknown(self):
+        # only the one reply the cancel allowed for is dropped silently
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        proc = jail_mod._spawn([sys.executable, "-c", "pass"])
+        try:
+            proxy = jail_mod._Proxy(proc, io.BytesIO(), io.BytesIO(), 5.0,
+                                    jail_mod.load_policy(pol))
+            proxy.pending.add(5, "tools/call", None)
+            proxy._on_client_message(cancel(5))
+            err = io.StringIO()
+            reply = {"jsonrpc": "2.0", "id": 5, "result": {}}
+            with redirect_stderr(err):
+                self.assertFalse(proxy._on_server_message(dict(reply)))
+                self.assertEqual(err.getvalue(), "")
+                self.assertFalse(proxy._on_server_message(dict(reply)))
+            self.assertIn("unknown id 5", err.getvalue())
+        finally:
+            jail_mod._stop(proc)
+
+    def test_a_cancel_that_names_nothing_trackable_leaves_every_id_alone(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        odd = [cancel(999), cancel("5"), cancel(True), cancel(None),
+               cancel(5.0), cancel([5]), cancel({"id": 5}), cancel(10 ** 30),
+               {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"reason": "no id"}},
+               {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": [5]},
+               {"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": "5"},
+               {"jsonrpc": "2.0", "method": "notifications/cancelled"}]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, raw = drive_rc(pol, self.server_cmd(),
+                                 [call(5, "slow", {})] + odd + [ping(2)],
+                                 timeout=1.0)
+        msgs = {m["id"]: m for m in map(json.loads, raw)}
+        self.assertEqual(sorted(msgs), [2, 5], msgs)
+        self.assertIn("result", msgs[2])
+        # call 5 was never named by an id that matches it: still owed, so it
+        # times out as any unanswered request does
+        self.assertEqual(msgs[5]["error"]["message"], "server timed out")
+        self.assertEqual(code, 3)
+        self.assertNotIn("internal error", err.getvalue())
+        self.assertEqual(len(self.seen()), 2 + len(odd))   # all were forwarded
+
+    def test_initialize_cannot_be_cancelled(self):
+        # MCP: a client must not cancel it. The cancel is not passed on and
+        # the handshake completes as ever (the server answers after 0.3 s)
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        code, raw = drive_rc(pol, self.server_cmd(), [
+            {"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}},
+            cancel(0)], timeout=8.0)
+        msgs = [json.loads(l) for l in raw]
+        self.assertEqual(code, 0)
+        self.assertEqual([m["id"] for m in msgs], [0])
+        self.assertIn("result", msgs[0])
+        self.assertEqual([m.get("method") for m in self.seen()], ["initialize"])
+        with open(jail_mod.AUDIT_LOG, encoding="utf-8") as f:
+            records = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["rejected"], "client")
+        self.assertEqual(records[0]["method"], "notifications/cancelled")
+        self.assertIn("initialize", records[0]["reason"])
+
+    def test_a_cancel_the_policy_drops_does_not_change_what_is_awaited(self):
+        pol = write_policy(self.tmp, {"allow_tools": ["*"],
+                                      "deny_methods": ["notifications/*"]})
+        code, raw = drive_rc(pol, self.server_cmd(),
+                             [call(5, "slow", {}), cancel(5)], timeout=1.0)
+        msgs = [json.loads(l) for l in raw]
+        self.assertEqual([m["error"]["message"] for m in msgs],
+                         ["server timed out"])
+        self.assertEqual(code, 3)
+        self.assertEqual([m.get("method") for m in self.seen()], ["tools/call"])
+
+    def test_no_policy_keeps_the_cancel_from_the_server(self):
+        gen = jail_mod.generate_policy(["read_file"], [("read_file", {"p": "a"})])
+        strict = dict(ALLOW_ALL, strict_args=True)
+        for name, raw_pol in (("allow all", ALLOW_ALL), ("strict", strict),
+                              ("starter", jail_mod.default_policy()),
+                              ("learned", gen),
+                              ("everything denied", {"allow_tools": [],
+                                                     "deny_tools": ["*"]})):
+            with self.subTest(policy=name):
+                pol = write_policy(self.tmp, raw_pol)
+                if os.path.exists(self.server_cmd()[2] + ".seen"):
+                    os.remove(self.marker + ".seen")
+                code, raw = drive_rc(pol, self.server_cmd(), [
+                    {"jsonrpc": "2.0", "id": 5, "method": "x/slow",
+                     "params": {"hold": True}}, cancel(5)], timeout=8.0)
+                self.assertEqual(code, 0, name)
+                self.assertEqual(
+                    [m.get("method") for m in self.seen()][-1:],
+                    ["notifications/cancelled"], name)
+
+    def test_a_cancel_inside_a_batch_counts(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        code, raw = drive_rc(pol, self.server_cmd(), [
+            json.dumps([call(7, "slow", {}), cancel(7)])], timeout=8.0)
+        self.assertEqual((code, raw), (0, []))
+
+    def test_the_ids_remembered_for_late_replies_are_bounded(self):
+        known = jail_mod._Cancelled(limit=3)
+        for key in ("1", "2", "3", "4", "5"):
+            known.add(key)
+        self.assertEqual(len(known), 3)
+        self.assertNotIn("1", known)
+        self.assertNotIn("2", known)
+        self.assertIn("5", known)
+        known.discard("5")
+        self.assertNotIn("5", known)
+        known.discard("never added")            # harmless
+
+    def test_a_new_request_under_a_cancelled_id_is_answered_normally(self):
+        proc = jail_mod._spawn([sys.executable, "-c", "pass"])
+        try:
+            proxy = jail_mod._Proxy(proc, io.BytesIO(), io.BytesIO(), 5.0,
+                                    jail_mod.compile_policy(dict(ALLOW_ALL)))
+            proxy.pending.add(5, "tools/call", None)
+            proxy._on_client_message(cancel(5))
+            proxy._on_client_message(ping(5))       # the id is used again
+            self.assertEqual(len(proxy.pending), 1)
+            self.assertTrue(proxy._on_server_message(
+                {"jsonrpc": "2.0", "id": 5, "result": {}}))
+            # that answered the new request. The cancelled one is forgotten
+            # with the id's reuse, so one more reply is an unknown one
+            err = io.StringIO()
+            with redirect_stderr(err):
+                self.assertFalse(proxy._on_server_message(
+                    {"jsonrpc": "2.0", "id": 5, "result": {}}))
+            self.assertIn("unknown id 5", err.getvalue())
+        finally:
+            jail_mod._stop(proc)
+
+    def test_readme_describes_cancellation(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())
+        for needle in ("`notifications/cancelled`", "initialize"):
+            self.assertTrue(needle in readme, f"the README does not say {needle}")
+        self.assertTrue("A request the client cancels is no longer awaited" in readme)
+
+
+def counting_float(counter: list):
+    """A float that counts the times it is compared."""
+    class Counted(float):
+        __hash__ = float.__hash__
+    for name in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__"):
+        def method(self, other, _op=getattr(float, name)):
+            counter[0] += 1
+            return _op(self, other)
+        setattr(Counted, name, method)
+    return Counted
+
+
+class WatchedDict(dict):
+    """A dict that counts how often something goes through all of it."""
+    walks = 0
+
+    def __iter__(self):
+        type(self).walks += 1
+        return super().__iter__()
+
+    def values(self):
+        type(self).walks += 1
+        return super().values()
+
+    def items(self):
+        type(self).walks += 1
+        return super().items()
+
+    def keys(self):
+        type(self).walks += 1
+        return super().keys()
+
+
+class TestManyInFlight(ProxyCase):
+    """R6-3: on every message the loop asked the pending requests how many
+    there were, which was due and when the next would be, by walking all of
+    them. With thousands in flight that is quadratic: 12,000 pipelined pings
+    took over a minute, and the jail's own slowness then made the early ones
+    "time out". The count and the next deadline are kept, not worked out."""
+
+    def test_thousands_of_requests_in_flight_are_all_answered_quickly(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        n = 5000
+        started = time.monotonic()
+        code, raw = drive_rc(pol, [sys.executable,
+                                   self.srv(FAKE_SERVER, "echo.py")],
+                             [ping(i) for i in range(1, n + 1)],
+                             timeout=15.0, join=120)
+        took = time.monotonic() - started
+        msgs = [json.loads(l) for l in raw]
+        errors = [m for m in msgs if "error" in m]
+        self.assertEqual(errors[:2], [], f"{len(errors)} requests failed")
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(m["id"] for m in msgs), list(range(1, n + 1)))
+        self.assertLess(took, 12.0)
+
+    def test_the_loop_does_not_look_at_every_request_each_time_round(self):
+        compared = [0]
+        Deadline = counting_float(compared)
+        n = 4000
+        pending = jail_mod._Pending()
+        pending._by_key = WatchedDict()
+        for i in range(n):
+            pending.add(i, "ping", Deadline(1000.0 + i))
+        compared[0] = 0
+        WatchedDict.walks = 0
+        for _ in range(100):                    # nothing is due
+            self.assertEqual(len(pending), n)
+            self.assertEqual(pending.expired(500.0), [])
+            self.assertEqual(pending.next_deadline(), 1000.0)
+        self.assertLess(compared[0], 1000)      # 100 * n, walking them all
+        compared[0] = 0
+        for i in range(n):                      # answered one by one
+            self.assertEqual(pending.pop(i)["id"], i)
+            self.assertEqual(pending.expired(500.0), [])
+            pending.next_deadline()
+            self.assertEqual(len(pending), n - i - 1)
+        self.assertLess(compared[0], 20 * n * 12)   # n * log2(n) is 48,000
+        self.assertIsNone(pending.next_deadline())
+        self.assertEqual(WatchedDict.walks, 0, "went through every request")
+
+    def test_pending_hands_out_what_is_due_and_nothing_else(self):
+        p = jail_mod._Pending()
+        p.add(1, "a", 10.0)
+        p.add("1", "b", 20.0)
+        p.add(1, "c", 30.0)                     # the id again: FIFO
+        p.add(2, "d", None)                     # no deadline: never due
+        p.add(3, "e", 25.0)
+        self.assertEqual(len(p), 5)
+        self.assertEqual(p.next_deadline(), 10.0)
+        self.assertEqual([e["method"] for e in p.expired(15.0)], ["a"])
+        self.assertEqual(len(p), 4)
+        self.assertEqual(p.peek(1)["method"], "c")
+        self.assertEqual(p.pop("1")["method"], "b")     # answered in time
+        self.assertEqual(p.next_deadline(), 25.0)       # b's is not left over
+        self.assertIsNone(p.pop("1"))
+        self.assertEqual([e["method"] for e in p.expired(26.0)], ["e"])
+        self.assertEqual(p.pop(3), None)                # it was timed out
+        self.assertEqual(p.next_deadline(), 30.0)
+        self.assertEqual([e["method"] for e in p.expired(1e9)], ["c"])
+        self.assertEqual(len(p), 1)
+        self.assertIsNone(p.next_deadline())
+        p.add(9, "y", 50.0)
+        self.assertEqual([e["method"] for e in p.drain()], ["d", "y"])
+        self.assertEqual(len(p), 0)
+        self.assertEqual(p.expired(1e9), [])        # nothing left to fall due
+        self.assertIsNone(p.next_deadline())
+        p.add(7, "x", 5.0)                      # still usable after a drain
+        self.assertEqual(p.pop(7)["method"], "x")
+        self.assertEqual(p.expired(1e9), [])
+
+    def test_a_request_answered_in_time_is_never_timed_out(self):
+        p = jail_mod._Pending()
+        p.add(1, "a", 5.0)
+        p.pop(1)
+        p.add(2, "b", 6.0)
+        self.assertEqual([e["id"] for e in p.expired(100.0)], [2])
+
+    def test_requests_that_are_answered_leave_nothing_behind(self):
+        p = jail_mod._Pending()
+        for i in range(20000):
+            p.add(i, "ping", 1e9)               # a deadline far away
+            p.pop(i)
+        self.assertEqual(len(p), 0)
+        self.assertLess(len(p._heap), 200)
+
+
+class TestAuditLimit(ProxyCase):
+    """R6-4c: `--audit --limit 0` printed the whole log and `--limit -1`
+    dropped the first line (a slice that counts from the end). N is a whole
+    number, 1 or more."""
+
+    def show(self, records, limit=50) -> list:
+        with open(jail_mod.AUDIT_LOG, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli_mod.cmd_audit(argparse.Namespace(limit=limit)), 0)
+        return buf.getvalue().splitlines()
+
+    @staticmethod
+    def records_in(lines) -> list:
+        return [l for l in lines if l.startswith(("DENY ", "allow "))]
+
+    def test_limit_takes_that_many_of_the_last_records(self):
+        records = [{"tool": f"t{i}", "decision": "allow", "reason": ""}
+                   for i in range(5)]
+        for limit, want in ((1, ["t4"]), (2, ["t3", "t4"]),
+                            (5, ["t0", "t1", "t2", "t3", "t4"]),
+                            (99, ["t0", "t1", "t2", "t3", "t4"])):
+            with self.subTest(limit=limit):
+                lines = self.show(records, limit=limit)
+                self.assertEqual([l.split()[1] for l in self.records_in(lines)],
+                                 want)
+
+    def test_limit_below_one_or_not_a_whole_number_is_an_error(self):
+        for bad in ("0", "-1", "-50", "1.5", "ten", "", "nan", "1e3"):
+            with self.subTest(limit=bad):
+                err = io.StringIO()
+                out = io.StringIO()
+                with redirect_stderr(err), redirect_stdout(out):
+                    with self.assertRaises(SystemExit) as raised:
+                        cli_mod.main(["--audit", "--limit", bad])
+                self.assertEqual(raised.exception.code, 2)
+                self.assertIn("--limit", err.getvalue())
+                self.assertEqual(out.getvalue(), "")
+
+    def test_the_same_from_the_command_line(self):
+        proc = subprocess.run(
+            [sys.executable, "-m", "mcp_jail", "--audit", "--limit", "0"],
+            env=child_env(), capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("--limit", proc.stderr)
+        self.assertNotIn("Traceback", proc.stderr)
+
+
+class TestClosedStandardStreams(ProxyCase):
+    """R6-4d: started with its stdin or stdout closed (a supervisor that
+    forgot a pipe; pythonw on Windows), Python has None for it, and the jail
+    died with a TypeError traceback - after it had started the server. It
+    says so in one line, exit status 2, and starts nothing."""
+
+    def marker_cmd(self):
+        marker = os.path.join(self.tmp, "started")
+        return marker, [sys.executable, "-c",
+                        f"open({marker!r}, 'w').close()"]
+
+    def closed(self, stdin, stdout):
+        return (mock.patch.object(sys, "stdin", stdin),
+                mock.patch.object(sys, "stdout", stdout))
+
+    def test_run_says_which_stream_is_missing_and_starts_nothing(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        marker, cmd = self.marker_cmd()
+        for name, (sin, sout), want in (
+                ("stdin", (None, io.BytesIO()), "standard input is closed"),
+                ("stdout", (io.BytesIO(), None), "standard output is closed"),
+                ("both", (None, None), "standard input and output are closed")):
+            with self.subTest(closed=name):
+                err = io.StringIO()
+                p_in, p_out = self.closed(sin, sout)
+                with p_in, p_out, redirect_stderr(err):
+                    code = jail_mod.run(pol, cmd)
+                self.assertEqual(code, 2)
+                self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                self.assertTrue(err.getvalue().startswith("mcp-jail: "))
+                self.assertIn(want, err.getvalue())
+                self.assertFalse(os.path.exists(marker), "the server was started")
+
+    def test_live_learn_needs_both_too(self):
+        marker, cmd = self.marker_cmd()
+        for name, (sin, sout), want in (
+                ("stdin", (None, io.BytesIO()), "standard input is closed"),
+                ("stdout", (io.BytesIO(), None), "standard output is closed")):
+            with self.subTest(closed=name):
+                err = io.StringIO()
+                p_in, p_out = self.closed(sin, sout)
+                with p_in, p_out, redirect_stderr(err):
+                    code = jail_mod.learn(cmd)
+                self.assertEqual(code, 2)
+                self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+                self.assertTrue(err.getvalue().startswith("mcp-jail learn: "))
+                self.assertIn(want, err.getvalue())
+                self.assertFalse(os.path.exists(marker), "the server was started")
+
+    def script(self):
+        path = os.path.join(self.tmp, "calls.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump([{"tool": "read_file", "arguments": {"path": "/a"}}], f)
+        return path
+
+    def test_a_learn_script_has_no_use_for_stdin_and_needs_stdout_without_out(self):
+        marker, cmd = self.marker_cmd()
+        err = io.StringIO()
+        p_in, p_out = self.closed(None, None)
+        with p_in, p_out, redirect_stderr(err):
+            code = jail_mod.learn(cmd, script=self.script())
+        self.assertEqual(code, 2)
+        self.assertEqual(err.getvalue().count("\n"), 1, err.getvalue())
+        self.assertIn("--out", err.getvalue())
+        self.assertFalse(os.path.exists(marker), "the server was started")
+        # given somewhere to write, the policy is learned all the same
+        out = os.path.join(self.tmp, "learned.json")
+        err = io.StringIO()
+        p_in, p_out = self.closed(None, None)
+        with p_in, p_out, redirect_stderr(err):
+            code = jail_mod.learn([sys.executable, self.server],
+                                  script=self.script(), out=out, timeout=10)
+        self.assertEqual(code, 0, err.getvalue())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["allow_tools"], ["read_file"])
+
+    @unittest.skipUnless(os.name == "posix", "closes a descriptor before exec")
+    def test_started_with_a_descriptor_closed(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        for fd, want in ((0, "standard input is closed"),
+                         (1, "standard output is closed")):
+            with self.subTest(fd=fd):
+                launcher = ("import os, sys\n"
+                            f"os.close({fd})\n"
+                            "os.execv(sys.executable, [sys.executable, '-m', "
+                            "'mcp_jail'] + sys.argv[1:])\n")
+                proc = subprocess.run(
+                    [sys.executable, "-c", launcher, "--policy", pol, "--",
+                     sys.executable, "-c", "pass"],
+                    env=child_env(), stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=60)
+                self.assertEqual(proc.returncode, 2, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertEqual(proc.stderr.count("\n"), 1, proc.stderr)
+                self.assertIn(want, proc.stderr)
+
+
+# Echoes params.x back; when started with a digit count it instead answers
+# every request with an integer of that many digits, written raw (never
+# parsed by the server, whose own Python would not read one that long).
+FAKE_BIGINT = r"""
+import json, sys
+raw_digits = int(sys.argv[1]) if len(sys.argv) > 1 else 0
+out = sys.stdout.buffer
+for raw in iter(sys.stdin.buffer.readline, b""):
+    req = json.loads(raw)
+    if req.get("id") is None:
+        continue
+    if raw_digits:
+        body = '{"jsonrpc":"2.0","id":%s,"result":{"n":%s}}' % (
+            json.dumps(req["id"]), "7" * raw_digits)
+    else:
+        body = json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                           "result": {"x": (req.get("params") or {}).get("x")}})
+    out.write(body.encode() + b"\n")
+    out.flush()
+"""
+
+
+class TestBigIntegers(ProxyCase):
+    """R6-4b: the README said integers of any size are exact. Python refuses
+    to turn more than 4300 digits into an int (3.10.7 and later; older ones
+    read any length, at a cost that grows with its square), and the jail took
+    that for bad JSON: a client's message got -32700 under a null id, and a
+    server's response was skipped as noise, so its request waited for
+    --timeout and the session ended with exit 3. The limit is the jail's own
+    now, the same on every Python, and a longer integer is refused like any
+    number the jail cannot carry (1e999): -32600 under the request's id, or
+    -32603 for the request a server's response answers, at once."""
+
+    def run_big(self, lines, server_digits=0, timeout=20.0):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        cmd = [sys.executable, self.srv(FAKE_BIGINT, "big.py")]
+        if server_digits:
+            cmd.append(str(server_digits))
+        return drive_rc(pol, cmd, lines, timeout=timeout)
+
+    @staticmethod
+    def ping_with(digits, rid=1):
+        return ('{"jsonrpc":"2.0","id":%s,"method":"ping","params":{"x":%s}}'
+                % (rid, digits))
+
+    def test_integers_of_4300_digits_go_through_exactly_both_ways(self):
+        for sign in ("", "-"):
+            with self.subTest(sign=sign):
+                x = sign + "7" * 4300
+                code, raw = self.run_big([self.ping_with(x)])
+                self.assertEqual(code, 0)
+                self.assertEqual(len(raw), 1)
+                self.assertIn(x.encode(), raw[0])
+                self.assertEqual(json.loads(raw[0])["result"]["x"], int(x))
+        code, raw = self.run_big([{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
+                                 server_digits=4300)
+        self.assertEqual(code, 0)
+        self.assertIn(b"7" * 4300, raw[0])
+
+    def test_a_longer_integer_from_the_client_is_refused_under_its_id(self):
+        for sign in ("", "-"):
+            with self.subTest(sign=sign):
+                code, raw = self.run_big([self.ping_with(sign + "7" * 4301, 9)])
+                self.assertEqual(code, 0)
+                reply = json.loads(raw[0])
+                self.assertEqual(reply["id"], 9)
+                self.assertEqual(reply["error"]["code"], -32600)
+                self.assertIn("4300 digits", reply["error"]["message"])
+                self.assertEqual(len(raw), 1)
+        with open(jail_mod.AUDIT_LOG, encoding="utf-8") as f:
+            records = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual({r["rejected"] for r in records}, {"client"})
+
+    def test_a_longer_integer_as_the_id_itself_leaves_the_id_null(self):
+        code, raw = self.run_big(
+            ['{"jsonrpc":"2.0","id":%s,"method":"ping"}' % ("7" * 4301)])
+        reply = json.loads(raw[0])
+        self.assertIsNone(reply["id"])
+        self.assertEqual(reply["error"]["code"], -32600)
+
+    def test_a_longer_integer_from_the_server_fails_the_request_at_once(self):
+        started = time.monotonic()
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, raw = self.run_big(
+                [{"jsonrpc": "2.0", "id": 1, "method": "ping"}],
+                server_digits=4301, timeout=60.0)
+        self.assertLess(time.monotonic() - started, 30.0, "it waited for --timeout")
+        self.assertEqual(code, 0)
+        reply = json.loads(raw[0])
+        self.assertEqual(reply["id"], 1)
+        self.assertEqual(reply["error"]["code"], -32603)
+        self.assertIn("4300 digits", reply["error"]["message"])
+        self.assertNotIn("non-JSON", err.getvalue())
+
+    @unittest.skipUnless(hasattr(sys, "set_int_max_str_digits"),
+                         "Python 3.10.0 - 3.10.6 have no such limit to lift")
+    def test_the_limit_is_the_jails_whatever_python_is_set_to(self):
+        line = (self.ping_with("7" * 4301) + "\n").encode()
+        old = sys.get_int_max_str_digits()
+        try:
+            for limit in (0, 640):          # none at all; the lowest allowed
+                sys.set_int_max_str_digits(limit)
+                msg, code, why = jail_mod._parse(line)
+                self.assertEqual((msg, code), (None, jail_mod.INVALID_REQUEST),
+                                 f"limit {limit}")
+                self.assertIn("4300 digits", why)
+            sys.set_int_max_str_digits(640)
+            msg, code, why = jail_mod._parse(
+                (self.ping_with("7" * 700) + "\n").encode())
+            self.assertEqual((msg, code), (None, jail_mod.INVALID_REQUEST))
+            self.assertIn("700 digits", why)
+        finally:
+            sys.set_int_max_str_digits(old)
+
+    def test_readme_gives_the_limit(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())
+        self.assertFalse("Integers of any size are exact" in readme,
+                         "the README still says integers of any size are exact")
+        self.assertEqual(readme.count("Integers of up to 4300 digits are exact"),
+                         2)
+
+
+# A server for the signal tests. It records its pid in <argv[1]>.pid. Mode
+# "eof" answers requests and, when its input ends, flushes its state for half
+# a second and writes <argv[1]>; "ignore_eof" never leaves of its own accord
+# (only a signal ends it); "busy" sleeps through a tools/call without reading
+# its input.
+FAKE_SIGNALLED = r"""
+import json, os, sys, time
+marker, mode = sys.argv[1], sys.argv[2]
+open(marker + ".pid", "w").write(str(os.getpid()))
+for raw in iter(sys.stdin.buffer.readline, b""):
+    req = json.loads(raw)
+    if mode == "busy" and req.get("method") == "tools/call":
+        time.sleep(120)
+    if req.get("id") is not None:
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                                     "result": {}}) + "\n")
+        sys.stdout.flush()
+if mode == "ignore_eof":
+    while True:
+        time.sleep(1)
+time.sleep(0.5)
+open(marker, "w").write("clean shutdown")
+"""
+
+
+def pid_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    try:                                    # a zombie has left, as far as we care
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+    except OSError:
+        return True
+
+
+class RealJail:
+    """mcp-jail as a program of its own (so that it can be sent signals),
+    wrapping FAKE_SIGNALLED. Its output goes to files: nothing to fill up."""
+
+    def __init__(self, case, mode, grace, args=(), command=None):
+        self.case = case
+        self.marker = os.path.join(case.tmp, "state")
+        self.err_path = os.path.join(case.tmp, "jail.err")
+        server = [sys.executable, case.srv(FAKE_SIGNALLED, "signalled.py"),
+                  self.marker, mode]
+        pol = write_policy(case.tmp, ALLOW_ALL)
+        cmd = command or ["--policy", pol, "--grace", str(grace),
+                          "--timeout", "30"]
+        self._out = open(os.path.join(case.tmp, "jail.out"), "wb")
+        self._err = open(self.err_path, "wb")
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "mcp_jail"] + cmd + list(args) + ["--"] + server,
+            stdin=subprocess.PIPE, stdout=self._out, stderr=self._err,
+            env=child_env())
+        case.addCleanup(self.cleanup)
+
+    def wait_started(self, limit=15.0) -> int:
+        """Return the server's pid once it is running (the jail has put its
+        signal handlers in place before it starts it)."""
+        path = self.marker + ".pid"
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            if os.path.exists(path):
+                with open(path) as f:
+                    text = f.read()
+                if text:
+                    self.server_pid = int(text)
+                    return self.server_pid
+            time.sleep(0.02)
+        raise AssertionError("the server did not start")
+
+    def wait(self, limit=20.0):
+        try:
+            return self.proc.wait(timeout=limit)
+        except subprocess.TimeoutExpired:
+            raise AssertionError(f"mcp-jail did not end within {limit}s")
+
+    def stderr(self) -> str:
+        self._err.flush()
+        with open(self.err_path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+
+    def server_gone(self, limit=5.0) -> bool:
+        end = time.monotonic() + limit
+        while time.monotonic() < end:
+            if not pid_running(self.server_pid):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def cleanup(self):
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        if getattr(self, "server_pid", None) and pid_running(self.server_pid):
+            try:
+                os.kill(self.server_pid, signal.SIGKILL)
+            except OSError:
+                pass
+        for f in (self._out, self._err):
+            f.close()
+        if self.proc.stdin:
+            try:
+                self.proc.stdin.close()
+            except OSError:
+                pass
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX signals")
+class TestStopSignals(ProxyCase):
+    """R6-4a: SIGTERM and SIGHUP killed the jail where it stood: no
+    shutdown, a server that was busy or ignores end-of-file left running,
+    exit status -15. They now end the session the way the client's leaving
+    does (close the server's input, wait --grace, stop it) and exit with 128
+    plus the signal number. A second signal does not wait."""
+
+    def test_sigterm_ends_the_session_like_the_client_leaving(self):
+        jail = RealJail(self, "eof", grace=5)
+        jail.wait_started()
+        started = time.monotonic()
+        jail.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(jail.wait(), 143)
+        # the server saw its input end and was given the time to finish
+        self.assertTrue(os.path.exists(jail.marker), "the server was cut short")
+        self.assertLess(time.monotonic() - started, 4.0)
+        self.assertTrue(jail.server_gone())
+        self.assertIn("SIGTERM received", jail.stderr())
+
+    def test_sighup_is_the_same_with_its_own_status(self):
+        jail = RealJail(self, "eof", grace=5)
+        jail.wait_started()
+        jail.proc.send_signal(signal.SIGHUP)
+        self.assertEqual(jail.wait(), 129)
+        self.assertTrue(os.path.exists(jail.marker), "the server was cut short")
+        self.assertTrue(jail.server_gone())
+        self.assertIn("SIGHUP received", jail.stderr())
+
+    def test_a_server_that_ignores_the_end_of_its_input_is_stopped_after_grace(self):
+        jail = RealJail(self, "ignore_eof", grace=1)
+        jail.wait_started()
+        started = time.monotonic()
+        jail.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(jail.wait(), 143)
+        took = time.monotonic() - started
+        self.assertGreaterEqual(took, 0.9, "it did not wait for --grace")
+        self.assertLess(took, 12.0)
+        self.assertTrue(jail.server_gone(), "the server was left running")
+        self.assertIn("did not exit within 1s", jail.stderr())
+
+    def test_a_busy_server_is_stopped_too(self):
+        jail = RealJail(self, "busy", grace=1)
+        jail.wait_started()
+        jail.proc.stdin.write(json.dumps(call(1, "long", {})).encode() + b"\n")
+        jail.proc.stdin.flush()
+        time.sleep(0.5)                     # it is inside the call now
+        jail.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(jail.wait(), 143)
+        self.assertTrue(jail.server_gone(), "the server was left running")
+
+    def test_a_signal_ends_the_wait_for_grace_that_was_already_under_way(self):
+        jail = RealJail(self, "ignore_eof", grace=60)
+        jail.wait_started()
+        jail.proc.stdin.close()             # the client has left: waiting 60s
+        time.sleep(1.0)
+        self.assertIsNone(jail.proc.poll(), "it did not wait for --grace")
+        started = time.monotonic()
+        jail.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(jail.wait(), 143)
+        self.assertLess(time.monotonic() - started, 12.0)
+        self.assertTrue(jail.server_gone())
+
+    def test_the_first_signal_waits_for_grace_and_the_second_does_not(self):
+        jail = RealJail(self, "ignore_eof", grace=60)
+        jail.wait_started()
+        jail.proc.send_signal(signal.SIGTERM)
+        time.sleep(1.0)
+        self.assertIsNone(jail.proc.poll(), "the first signal did not wait")
+        started = time.monotonic()
+        jail.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(jail.wait(10), 143)
+        self.assertLess(time.monotonic() - started, 5.0)
+        self.assertTrue(jail.server_gone(), "the server was left running")
+
+    def test_ctrl_c_still_stops_at_once_and_is_not_an_error(self):
+        jail = RealJail(self, "ignore_eof", grace=60)
+        jail.wait_started()
+        started = time.monotonic()
+        jail.proc.send_signal(signal.SIGINT)
+        self.assertEqual(jail.wait(), 0)
+        self.assertLess(time.monotonic() - started, 12.0)
+        self.assertTrue(jail.server_gone())
+
+    def test_live_learn_ends_on_sigterm_and_still_writes_the_policy(self):
+        out = os.path.join(self.tmp, "learned.json")
+        jail = RealJail(self, "eof", grace=5, command=["learn", "--out", out])
+        # `learn` is its own command: the arguments are built to suit
+        jail.wait_started()
+        jail.proc.stdin.write(json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "t", "arguments": {}}}).encode() + b"\n")
+        jail.proc.stdin.flush()
+        time.sleep(0.5)
+        jail.proc.send_signal(signal.SIGTERM)
+        self.assertEqual(jail.wait(), 0, jail.stderr())
+        with open(out, encoding="utf-8") as f:
+            self.assertEqual(json.load(f)["allow_tools"], ["t"])
+
+
+class TestStopSignalsInTheLoop(ProxyCase):
+    """The same through the proxy's queue, which is what the handler feeds: no
+    real signal, so it runs everywhere (Ctrl-Break reaches the jail the same
+    way on Windows)."""
+
+    def start(self, mode, client_in):
+        self.marker = os.path.join(self.tmp, "state")
+        proc = jail_mod._spawn([sys.executable,
+                                self.srv(FAKE_SIGNALLED, "signalled.py"),
+                                self.marker, mode])
+        self.addCleanup(jail_mod._stop, proc)
+        return proc
+
+    def open_client(self):
+        r, w = os.pipe()
+        stdin = os.fdopen(r, "rb")
+        self.addCleanup(stdin.close)
+        keep = os.fdopen(w, "wb")
+        self.addCleanup(keep.close)
+        return stdin, keep
+
+    @staticmethod
+    def serve(proxy, limit=30.0):
+        """proxy.serve() on a thread of its own, so that a loop that never
+        ends fails the test instead of hanging it."""
+        result = []
+        t = threading.Thread(target=lambda: result.append(proxy.serve()),
+                             daemon=True)
+        t.start()
+        t.join(limit)
+        if t.is_alive():
+            raise AssertionError("the proxy did not end (hung?)")
+        return result[0]
+
+    def test_a_noted_signal_ends_the_session_through_the_grace_wait(self):
+        stdin, keep = self.open_client()
+        proc = self.start("eof", stdin)
+        proxy = jail_mod._Proxy(proc, stdin, io.BytesIO(), 30.0,
+                                compiled(ALLOW_ALL), grace=5.0)
+        proxy.q.put(("signal", 15))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = self.serve(proxy)
+        self.assertEqual(code, 143)
+        self.assertEqual(proc.wait(timeout=10), 0)  # it left of its own accord
+        self.assertTrue(os.path.exists(self.marker), "the server was cut short")
+        self.assertIn("SIGTERM received", err.getvalue())
+
+    def test_with_no_grace_the_signal_stops_the_server_at_once(self):
+        stdin, keep = self.open_client()
+        proc = self.start("ignore_eof", stdin)
+        proxy = jail_mod._Proxy(proc, stdin, io.BytesIO(), 30.0,
+                                compiled(ALLOW_ALL), grace=0.0)
+        proxy.q.put(("signal", 15))
+        started = time.monotonic()
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.serve(proxy), 143)
+        self.assertLess(time.monotonic() - started, 3.0)
+
+    def test_a_signal_during_the_grace_wait_ends_it(self):
+        stdin, keep = self.open_client()
+        proc = self.start("ignore_eof", stdin)
+        proxy = jail_mod._Proxy(proc, stdin, io.BytesIO(), 30.0,
+                                compiled(ALLOW_ALL), grace=60.0)
+        keep.close()                                # the client has left
+        timer = threading.Timer(1.0, proxy.q.put, [("signal", 1)])
+        timer.start()
+        self.addCleanup(timer.cancel)
+        started = time.monotonic()
+        with redirect_stderr(io.StringIO()):
+            code = self.serve(proxy)
+        self.assertEqual(code, 129)
+        self.assertLess(time.monotonic() - started, 10.0)
+
+    def test_the_exit_status_is_the_signal_even_after_a_timeout(self):
+        stdin, keep = self.open_client()
+        proc = self.start("busy", stdin)
+        proxy = jail_mod._Proxy(proc, stdin, io.BytesIO(), 30.0,
+                                compiled(ALLOW_ALL), grace=5.0)
+        proxy.timed_out = 1
+        proxy.q.put(("signal", 15))
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.serve(proxy), 143)
+
+    def test_a_signal_that_came_before_the_proxy_existed_is_not_lost(self):
+        stop = jail_mod._StopSignals()
+        stop._on_signal(signal.SIGTERM, None)       # nothing to tell yet
+        stdin, keep = self.open_client()
+        proc = self.start("eof", stdin)
+        proxy = jail_mod._Proxy(proc, stdin, io.BytesIO(), 30.0,
+                                compiled(ALLOW_ALL), grace=5.0, stop=stop)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(self.serve(proxy), 128 + signal.SIGTERM)
+
+    def test_a_second_signal_is_the_hard_one(self):
+        stop = jail_mod._StopSignals()
+        killed = []
+        stop._hard_exit = killed.append
+        stop._on_signal(signal.SIGTERM, None)
+        self.assertEqual(killed, [])
+        stop._on_signal(signal.SIGTERM, None)
+        self.assertEqual(killed, [signal.SIGTERM])
+
+    def test_which_signals_are_taken_depends_on_the_platform(self):
+        class Posix:
+            SIGTERM, SIGHUP = 15, 1
+
+        class Windows:
+            SIGTERM, SIGBREAK = 15, 21
+
+        with mock.patch.object(jail_mod, "signal", Posix):
+            self.assertEqual(jail_mod._stop_signals(), [15, 1])
+        with mock.patch.object(jail_mod, "signal", Windows):
+            self.assertEqual(jail_mod._stop_signals(), [15, 21])
+
+    @unittest.skipUnless(hasattr(signal, "SIGTERM"), "signals")
+    def test_the_handlers_are_taken_for_the_session_and_given_back(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        before = {s: signal.getsignal(s) for s in jail_mod._stop_signals()}
+        seen = {}
+        real = jail_mod._Proxy.serve
+
+        def serve(proxy):
+            seen.update({s: signal.getsignal(s) for s in before})
+            return real(proxy)
+
+        with mock.patch.object(jail_mod._Proxy, "serve", serve):
+            code = jail_mod.run(pol, [sys.executable, "-c", "pass"],
+                                stdin=io.BytesIO(b""), stdout=io.BytesIO())
+        self.assertEqual(code, 0)
+        after = {s: signal.getsignal(s) for s in before}
+        self.assertEqual(after, before)
+        if threading.current_thread() is threading.main_thread():
+            for s in before:
+                self.assertNotEqual(seen[s], before[s], "not taken")
+
+    @unittest.skipUnless(hasattr(signal, "SIGHUP"), "POSIX signals")
+    def test_a_signal_that_was_being_ignored_still_is(self):
+        # nohup mcp-jail ...: the caller asked not to be hung up on
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        old = signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        seen = []
+        real = jail_mod._Proxy.serve
+
+        def serve(proxy):
+            seen.append(signal.getsignal(signal.SIGHUP))
+            return real(proxy)
+
+        try:
+            with mock.patch.object(jail_mod._Proxy, "serve", serve):
+                jail_mod.run(pol, [sys.executable, "-c", "pass"],
+                             stdin=io.BytesIO(b""), stdout=io.BytesIO())
+            after = signal.getsignal(signal.SIGHUP)
+        finally:
+            signal.signal(signal.SIGHUP, old)
+        if threading.current_thread() is threading.main_thread():
+            self.assertEqual(seen, [signal.SIG_IGN])
+        self.assertEqual(after, signal.SIG_IGN)
+
+    def test_off_the_main_thread_nothing_is_taken(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        before = {s: signal.getsignal(s) for s in jail_mod._stop_signals()}
+        result = []
+
+        def target():
+            result.append(jail_mod.run(pol, [sys.executable, "-c", "pass"],
+                                       stdin=io.BytesIO(b""),
+                                       stdout=io.BytesIO()))
+
+        t = threading.Thread(target=target)
+        t.start()
+        t.join(30)
+        self.assertEqual(result, [0])
+        self.assertEqual({s: signal.getsignal(s) for s in before}, before)
+
+    def test_readme_says_what_the_signals_do(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())
+        for needle in ("SIGTERM", "SIGHUP", "SIGBREAK", "`143`", "`129`",
+                       "A second signal"):
+            self.assertTrue(needle in readme, f"the README does not say {needle}")
+
+
+class SpyQueue:
+    """A queue that remembers how long each get() was willing to wait."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.timeouts = []
+
+    def put(self, item):
+        self._inner.put(item)
+
+    def get(self, block=True, timeout=None):
+        self.timeouts.append(timeout)
+        return self._inner.get(block, timeout)
+
+
+class TestIdleWake(ProxyCase):
+    """R6-5: the loop waited on its queue with no timeout when nothing was
+    due. On Windows a wait like that cannot be interrupted, so Ctrl-C was
+    only noticed when the next message came (live `learn` "until Ctrl-C"
+    went on until the server said something). It looks up every half second
+    now; idle, that costs nothing worth counting."""
+
+    def test_an_idle_loop_wakes_up_instead_of_waiting_for_ever(self):
+        r, w = os.pipe()
+        stdin, keep = os.fdopen(r, "rb"), os.fdopen(w, "wb")
+        self.addCleanup(stdin.close)
+        self.addCleanup(keep.close)
+        proc = jail_mod._spawn([sys.executable, "-c",
+                                "import sys; sys.stdin.read()"])
+        self.addCleanup(jail_mod._stop, proc)
+        proxy = jail_mod._Proxy(proc, stdin, io.BytesIO(), 0,
+                                compiled(ALLOW_ALL), grace=0.0)
+        spy = proxy.q = SpyQueue(proxy.q)
+        timer = threading.Timer(1.6, keep.close)    # the client leaves
+        timer.start()
+        self.addCleanup(timer.cancel)
+        cpu = time.process_time()
+        result = []
+        t = threading.Thread(target=lambda: result.append(proxy.serve()),
+                             daemon=True)
+        t.start()
+        t.join(30)
+        self.assertFalse(t.is_alive(), "the proxy did not end (hung?)")
+        self.assertEqual(result, [0])
+        self.assertGreaterEqual(len(spy.timeouts), 3, spy.timeouts)
+        self.assertTrue(all(w is not None and w <= 0.5 for w in spy.timeouts),
+                        spy.timeouts)
+        self.assertLess(time.process_time() - cpu, 0.5, "idle, but busy")
+
+    def test_a_far_off_deadline_does_not_make_it_wait_longer(self):
+        r, w = os.pipe()
+        stdin, keep = os.fdopen(r, "rb"), os.fdopen(w, "wb")
+        self.addCleanup(stdin.close)
+        proc = jail_mod._spawn([sys.executable,
+                                self.srv(FAKE_SLOW, "slow.py")])
+        self.addCleanup(jail_mod._stop, proc)
+        proxy = jail_mod._Proxy(proc, stdin, io.BytesIO(), 3000.0,
+                                compiled(ALLOW_ALL), grace=0.0)
+        spy = proxy.q = SpyQueue(proxy.q)
+        keep.write(json.dumps(call(1, "t", {"delay": 1.2})).encode() + b"\n")
+        keep.close()                    # the client is done once it is answered
+        result = []
+        t = threading.Thread(target=lambda: result.append(proxy.serve()),
+                             daemon=True)
+        t.start()
+        t.join(30)
+        self.assertFalse(t.is_alive(), "the proxy did not end (hung?)")
+        self.assertEqual(result, [0])
+        self.assertTrue(all(w is not None and w <= 0.5 for w in spy.timeouts),
+                        spy.timeouts)
+        self.assertGreaterEqual(len(spy.timeouts), 2)
+
+    def test_learn_script_waits_the_same_way(self):
+        proc = jail_mod._spawn([sys.executable, self.srv(FAKE_SLOW, "slow.py")])
+        session = jail_mod._Session(proc)
+        spy = session.q = SpyQueue(session.q)
+        try:
+            status = session.request(
+                {"jsonrpc": "2.0", "id": 7, "method": "tools/call",
+                 "params": {"name": "t", "arguments": {"delay": 1.2}}}, 0)
+        finally:
+            session.close()
+            jail_mod._stop(proc)
+        self.assertEqual(status[0], "ok")
+        self.assertTrue(all(w is not None and w <= 0.5 for w in spy.timeouts),
+                        spy.timeouts)
+        self.assertGreaterEqual(len(spy.timeouts), 2)
 
 
 class TestHarnessIsHermetic(unittest.TestCase):
