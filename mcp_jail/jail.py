@@ -21,9 +21,11 @@ runs the same way on Windows as on POSIX (no select() on pipes).
 from __future__ import annotations
 
 import collections
+import difflib
 import fnmatch
 import io
 import json
+import math
 import os
 import queue
 import re
@@ -42,6 +44,52 @@ from . import VERSION
 # answers with the revision it will speak; stdio has nowhere else to put
 # it, so learn only reports it.
 PROTOCOL_VERSION = "2025-06-18"
+
+# Tests patch this to exercise the Windows branches on any OS.
+_WINDOWS = os.name == "nt"
+
+# Exit codes: 0 a clean session, 2 unusable policy / script / command (or a
+# learn session that ended early), 3 the server failed while the jail was
+# relaying: it exited or closed its pipes, stopped reading its input, or did
+# not answer a request within --timeout.
+EXIT_SERVER = 3
+
+# The longest one wait on the queue may last. threading refuses a longer
+# timeout outright (OverflowError, a traceback), and the loop looks at its
+# deadlines again on every pass, so nothing is lost by waking up now and then.
+_MAX_BLOCK = 3600.0
+
+# Once the client has gone and nothing is owed, the server is given this many
+# seconds to finish and exit on its own (--grace; 0 stops it at once). One that
+# is still there is sent SIGTERM (terminate(): TerminateProcess on Windows) and,
+# if it ignores that for _TERM_WAIT seconds, killed.
+DEFAULT_GRACE = 5.0
+_TERM_WAIT = 5.0
+
+
+def seconds_problem(value) -> "str | None":
+    """Why `value` cannot be a number of seconds for --timeout or --grace
+    (None: it can). float() takes "nan" and "inf" and a minus sign: nan and a
+    negative value quietly meant "no timeout", and inf died in the first
+    wait."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "is not a number"
+    if not math.isfinite(value):
+        return "must be a finite number of seconds"
+    if value < 0:
+        return "must not be negative"
+    return None
+
+
+def _refuse_seconds(**options) -> "str | None":
+    """The message for the first of `options` (name=value) that is not a
+    usable number of seconds, else None. The command line refuses such a
+    value before this; this is for whoever calls run() or learn()."""
+    for name, value in options.items():
+        why = seconds_problem(value)
+        if why is not None:
+            return f"--{name} {value!r} {why}"
+    return None
 
 # ---------------------------------------------------------------------------
 # paths
@@ -122,6 +170,34 @@ def normalize_tool_name(name: str) -> str:
     text = "".join(ch for ch in text
                    if unicodedata.category(ch) not in _IGNORED_NAME_CATEGORIES)
     return text.strip()
+
+
+# The members a JSON-RPC message is made of, and the fields of a policed
+# method's params that the jail reads (see _key_clash).
+_ENVELOPE_KEYS = ("jsonrpc", "id", "method", "params", "result", "error")
+_PARAM_KEYS = ("name", "arguments", "uri", "ref")
+
+
+def _key_clash(obj: dict, keys) -> "str | None":
+    """A key of `obj` that is not one of `keys` but reads as one of them: a
+    different case (METHOD), a Unicode fold (U+017F, the long s, reads as
+    `s`, so "param" + U+017F is `params`), invisible characters, a
+    compatibility form. Go's encoding/json, C#'s System.Text.Json (when told
+    to) and Jackson (when told to) match member names without regard to case
+    and let the last duplicate win, so such a key beside the real one - or in
+    its place - makes the jail and that server disagree about what the
+    message says. The jail refuses it rather than guess which of the
+    spellings its peer would read. None if no key clashes."""
+    for key in obj:
+        if key not in keys and normalize_tool_name(key) in keys:
+            return key
+    return None
+
+
+def _clash_text(key: str) -> str:
+    return (f"key {ascii(key)} is another spelling of "
+            f"{ascii(normalize_tool_name(key))}; a parser that ignores case "
+            f"would read it as that key")
 
 
 def _strict_end_anchors(pattern: str) -> str:
@@ -264,6 +340,30 @@ def _compile_rule_set(spec, where: str = "arg_rules",
     return rules
 
 
+# The keys a policy may carry. Anything else is refused at load: a mistyped
+# `alow_tools` used to be skipped silently, and a policy that ignores its own
+# allowlist allows every tool.
+POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
+               "deny_methods", "strict_args", "audit_args", "hide_denied")
+# Notes: written by --init-policy and by `learn`, never read.
+NOTE_KEYS = ("_comment", "_not_called")
+RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
+# compile_policy() marks the dict it has compiled with these; a policy
+# file must not be able to carry them (a forged marker skips validation).
+_INTERNAL_KEYS = ("_compiled", "_rules_by_norm")
+
+
+def _check_keys(obj: dict, allowed, where: str) -> None:
+    """Refuse a key that is not in `allowed`, with a did-you-mean."""
+    for key in obj:
+        if key in allowed:
+            continue
+        close = difflib.get_close_matches(str(key), allowed, n=1, cutoff=0.6)
+        hint = f" (did you mean {close[0]!r}?)" if close else ""
+        raise ValueError(f"{where + ': ' if where else ''}unknown key "
+                         f"{key!r}{hint}; allowed keys: {', '.join(allowed)}")
+
+
 def _method_list(pol: dict, key: str) -> list[str]:
     val = pol.get(key)
     if val is None:
@@ -275,17 +375,96 @@ def _method_list(pol: dict, key: str) -> list[str]:
 
 
 def method_denied(pol: dict, method: str) -> bool:
-    """deny_methods: exact names or fnmatch globs (`resources/*`)."""
+    """deny_methods: exact names or fnmatch globs (`resources/*`). A method
+    is matched as written, and as a router that ignores case and invisible
+    characters would read it (`RESOURCES/LIST`; "resource" + U+017F +
+    "/list"), against the pattern as written and likewise normalised."""
+    folded = normalize_tool_name(method)
     return any(fnmatch.fnmatchcase(method, pat)
+               or fnmatch.fnmatchcase(folded, normalize_tool_name(pat))
                for pat in (pol.get("deny_methods") or []))
 
 
 def method_policed(pol: dict, method: str) -> bool:
     """tools/call is always policed; policed_methods adds more (their
-    params.name -- or params.uri -- is the tool name, params.arguments
-    the arguments)."""
-    return method == "tools/call" or method in (
-        pol.get("policed_methods") or [])
+    params.name -- or params.uri -- is the tool name, params.arguments the
+    arguments). Spelling does not matter: `Tools/Call` is policed as
+    tools/call."""
+    folded = normalize_tool_name(method)
+    return folded == "tools/call" or any(
+        folded == normalize_tool_name(m)
+        for m in (pol.get("policed_methods") or []))
+
+
+# What a policed method's params are judged by: the field that really
+# selects what the call touches. allow_tools / deny_tools are compared with
+# that field and with nothing else, and a second selector beside it is
+# refused rather than preferred - a server need not make the jail's choice.
+_SELECTORS = {
+    "tools/call": "name",
+    "prompts/get": "name",
+    "resources/read": "uri",
+    "resources/subscribe": "uri",
+    "resources/unsubscribe": "uri",
+    "completion/complete": "ref",   # {"type": "ref/prompt", "name": ...} or
+                                    # {"type": "ref/resource", "uri": ...}
+}
+_REF_KEYS = ("type", "name", "uri")
+
+
+def _selected(method_key: str, params: dict) -> tuple:
+    """What the policy is to judge for a policed method: (name, None), or
+    (None, why) when `params` do not say unambiguously what the call is for.
+    `method_key` is the normalised method. A method added through
+    policed_methods that this table does not know takes exactly one of `name`
+    and `uri`."""
+    field = _SELECTORS.get(method_key)
+    if field is None:
+        present = [k for k in ("name", "uri") if k in params]
+        if len(present) != 1:
+            return None, (f"{method_key}: params must carry exactly one of "
+                          f"'name' and 'uri', got "
+                          f"{' and '.join(map(repr, present)) or 'neither'}")
+        field = present[0]
+    competing = [k for k in ("name", "uri") if k != field and k in params]
+    if competing:
+        return None, (f"{method_key} selects by '{field}', but params also "
+                      f"carries '{competing[0]}'")
+    if field == "ref":
+        return _ref_selected(method_key, params.get("ref"))
+    value = params.get(field)
+    if not isinstance(value, str) or not value:
+        return None, (f"{method_key} selects by '{field}': params.{field} "
+                      f"must be a non-empty string")
+    return value, None
+
+
+def _ref_selected(method_key: str, ref) -> tuple:
+    """The prompt name or resource uri that a completion/complete `ref`
+    names. A ref that says it is a prompt may not also carry a uri, nor a
+    resource ref a name: a server that picks by which field is present would
+    pick the other one."""
+    if not isinstance(ref, dict):
+        return None, (f"{method_key} selects by 'ref': params.ref must be an "
+                      f"object")
+    clash = _key_clash(ref, _REF_KEYS)
+    if clash is not None:
+        return None, "params.ref: " + _clash_text(clash)
+    kind = ref.get("type")
+    if kind == "ref/prompt":
+        field, other = "name", "uri"
+    elif kind == "ref/resource":
+        field, other = "uri", "name"
+    else:
+        return None, (f"params.ref.type must be ref/prompt or ref/resource, "
+                      f"got {_clip(kind, 40)}")
+    if other in ref:
+        return None, (f"params.ref is a {kind} but also carries '{other}'")
+    value = ref.get(field)
+    if not isinstance(value, str) or not value:
+        return None, (f"params.ref ({kind}) must carry a non-empty string "
+                      f"'{field}'")
+    return value, None
 
 
 def compile_policy(pol: dict) -> dict:
@@ -294,8 +473,9 @@ def compile_policy(pol: dict) -> dict:
     at startup. A compiled policy is marked and never recompiled."""
     if not isinstance(pol, dict):
         raise ValueError("policy must be a JSON object")
-    if pol.get("_compiled"):
+    if pol.get("_compiled") and "_rules_by_norm" in pol:
         return pol
+    _check_keys(pol, POLICY_KEYS + NOTE_KEYS, "")
     rules_by_tool = pol.get("arg_rules") or {}
     if not isinstance(rules_by_tool, dict):
         raise ValueError("arg_rules must be an object keyed by tool name")
@@ -304,6 +484,7 @@ def compile_policy(pol: dict) -> dict:
         if not isinstance(rules, dict):
             raise ValueError(f"arg_rules.{tool} must be an object with "
                              f"'allow' and/or 'deny'")
+        _check_keys(rules, RULE_KEYS, f"arg_rules.{tool}")
         allow = rules.get("allow")
         if allow == "*":
             pass  # explicit: any arguments (deny rules still apply)
@@ -323,6 +504,11 @@ def compile_policy(pol: dict) -> dict:
         val = pol.get(key)
         if val is not None and not isinstance(val, (list, tuple, set, dict)):
             raise ValueError(f"{key} must be a list of tool names")
+        for entry in (val or ()):
+            # a nested list or a number would be skipped by every match
+            if not isinstance(entry, str) or not entry:
+                raise ValueError(f"{key} must hold tool name strings, "
+                                 f"got {entry!r}")
     for key in ("policed_methods", "deny_methods"):
         _method_list(pol, key)
     mode = pol.get("audit_args", "denied")
@@ -331,19 +517,34 @@ def compile_policy(pol: dict) -> dict:
                          f"got {mode!r}")
     if not isinstance(pol.get("strict_args", False), bool):
         raise ValueError("strict_args must be true or false")
+    if not isinstance(pol.get("hide_denied", True), bool):
+        raise ValueError("hide_denied must be true or false")
     pol["_compiled"] = True
     return pol
 
 
 def load_policy(path: str) -> dict:
+    """Read and compile a policy file. Refused (ValueError, JSONDecodeError
+    or re.error): invalid JSON, a duplicate key anywhere (the reader would
+    keep only the last one: `deny_tools` twice is `deny_tools` once, and the
+    wrong one), the internal markers, an unknown key, a bad rule."""
     with open(path, encoding="utf-8") as f:
-        pol = json.load(f)
+        try:
+            pol = json.load(f, object_pairs_hook=_no_duplicate_keys,
+                            parse_constant=_no_constants)
+        except _DuplicateKey as e:
+            raise ValueError(f"{e} (a key may appear once)") from None
+    if isinstance(pol, dict):
+        for key in _INTERNAL_KEYS:
+            if key in pol:
+                raise ValueError(f"{key!r} is reserved for mcp-jail's own use")
     return compile_policy(pol)
 
 
 def default_policy() -> dict:
     return {
-        "_comment": "mcp-jail policy. allow_tools/deny_tools are tool names "
+        "_comment": "mcp-jail policy. Unknown keys are refused at startup. "
+                    "allow_tools/deny_tools are tool names "
                     "('*' = all; deny wins; names are compared normalised: "
                     "NFKC, case-folded, trimmed, invisible characters "
                     "removed). arg_rules.<tool>.allow/deny map argument "
@@ -569,6 +770,7 @@ def filter_tools_list(pol: dict, result) -> None:
         return
     result["tools"] = [t for t in tools
                        if isinstance(t, dict)
+                       and _key_clash(t, ("name",)) is None
                        and tool_visible(pol, t.get("name"))[0]]
 
 
@@ -658,6 +860,36 @@ def _preview(line: bytes, limit: int = 200) -> str:
     return repr(text[:limit] + ("..." if len(text) > limit else ""))
 
 
+def _clip(value, limit: int = AUDIT_VALUE_MAX) -> str:
+    """A message (the wire line, or the parsed object) cut down for the
+    audit record."""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", "replace").strip()
+    else:
+        try:
+            text = json.dumps(value)
+        except (ValueError, RecursionError):
+            text = f"<{type(value).__name__}>"
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"...(+{len(text) - limit})"
+
+
+def _salvage_id(line: bytes):
+    """The id of a client line that was refused, when there is one to
+    trust: it parses, has exactly one "id" key and that holds a string or
+    an integer. Otherwise _NO_ID (the refusal then carries a null id)."""
+    try:
+        obj = json.loads(line.decode("utf-8"),
+                         object_pairs_hook=_no_duplicate_keys)
+    except (ValueError, RecursionError):
+        return _NO_ID
+    rid = obj.get("id") if isinstance(obj, dict) else None
+    if isinstance(rid, bool) or not isinstance(rid, (str, int)):
+        return _NO_ID
+    return rid
+
+
 def _rpc_error(req_id, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": req_id,
             "error": {"code": code, "message": message}}
@@ -669,7 +901,14 @@ def _id_key(req_id) -> str:
 
 
 def _encode(obj) -> bytes:
-    return (json.dumps(obj) + "\n").encode("utf-8")
+    """The one wire form of every message the jail writes, to either side:
+    compact JSON, pure ASCII (every non-ASCII character an escape, so no
+    raw U+2028 or NEL for a line-splitting reader to trip over), finite
+    numbers only, one trailing newline. It is built from the object the jail
+    parsed and checked - never from the peer's bytes - so the jail and
+    whatever reads the line cannot disagree about what it says."""
+    return (json.dumps(obj, ensure_ascii=True, allow_nan=False,
+                       separators=(",", ":")) + "\n").encode("ascii")
 
 
 class _FdLineReader:
@@ -742,6 +981,152 @@ class _Writer:
         self.write(_encode(obj))
 
 
+class _ServerInput:
+    """Everything the jail sends to the server goes through here: queued by
+    the proxy, written by a thread of its own.
+
+    A write to a pipe blocks while the pipe is full, and a server that has
+    stopped reading (hung, deadlocked, busy for good) leaves it full. Done on
+    the thread that also answers the client, that write froze the whole proxy
+    and kept --timeout from ever firing. So the proxy only queues, and asks
+    stalled(): has the oldest message waited longer than --timeout to be
+    taken?
+
+    The thread writes with os.write() to a duplicate of the descriptor. No
+    buffered stream is involved, so there is no lock for another thread to
+    wedge on and nothing for interpreter shutdown to wait for. The thread
+    closes that descriptor itself, and nothing else does: a descriptor closed
+    under a blocked write can be handed to the next open() and written to by
+    mistake. A write that is stuck can only be ended from the other side, so
+    a stalled server is killed (see _Proxy.serve); if the thread is still
+    stuck after that (a grandchild holds the pipe open) it is a daemon and
+    dies with the process.
+
+    `notify` is called from the thread: with None after each message that
+    went out, with the exception when writing failed (the server's stdin is
+    gone). `timeout` None means a message may wait for ever.
+    """
+
+    def __init__(self, stream, timeout: "float | None", notify):
+        self._timeout = timeout
+        self._notify = notify
+        self._cv = threading.Condition()
+        self._items: "collections.deque" = collections.deque()  # (bytes, when queued)
+        self._closing = False   # no more messages: finish these, then stop
+        self._aborted = False   # stop now
+        self._ended = False     # the thread has finished
+        self._stream = None
+        self._fd = None
+        try:
+            fd = stream.fileno()
+        except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+            self._stream = stream   # not a descriptor (tests): write + flush
+        else:
+            self._fd = os.dup(fd)
+            if _WINDOWS:
+                # a C runtime descriptor may be in text mode, which would turn
+                # every "\n" into "\r\n": the wire is bytes
+                try:
+                    import msvcrt
+                    msvcrt.setmode(self._fd, getattr(os, "O_BINARY", 0))
+                except BaseException:
+                    os.close(self._fd)
+                    raise
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="mcp-jail-server-writer")
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def put(self, data: bytes) -> bool:
+        """Queue one message. False when the server can no longer be written
+        to (its stdin broke, or the input was closed or aborted)."""
+        with self._cv:
+            if self._ended or self._closing or self._aborted:
+                return False
+            self._items.append((data, time.monotonic()))
+            self._cv.notify()
+        return True
+
+    def busy(self) -> bool:
+        """Is some queued message not yet fully written?"""
+        with self._cv:
+            return bool(self._items)
+
+    def stall_deadline(self) -> "float | None":
+        """When the oldest message not yet taken has waited --timeout."""
+        with self._cv:
+            if self._timeout and self._items:
+                return self._items[0][1] + self._timeout
+        return None
+
+    def stalled(self, now: float) -> bool:
+        deadline = self.stall_deadline()
+        return deadline is not None and deadline <= now
+
+    def close(self) -> None:
+        """No more messages: write what is queued, then close the pipe."""
+        with self._cv:
+            self._closing = True
+            self._cv.notify_all()
+
+    def abort(self) -> None:
+        """Stop at the next chance. A write already blocked in the pipe only
+        ends when the server's end goes away."""
+        with self._cv:
+            self._aborted = True
+            self._cv.notify_all()
+
+    def alive(self) -> bool:
+        return self._thread.is_alive()
+
+    def join(self, timeout: float) -> None:
+        if self._thread.ident is not None:
+            self._thread.join(timeout)
+
+    def _write_all(self, data: bytes) -> None:
+        if self._fd is None:
+            self._stream.write(data)
+            self._stream.flush()
+            return
+        view = memoryview(data)
+        while len(view):
+            if self._aborted:
+                raise BrokenPipeError("input aborted")
+            written = os.write(self._fd, view)
+            if written <= 0:
+                raise BrokenPipeError("short write to the server")
+            view = view[written:]
+
+    def _run(self) -> None:
+        failure = None
+        try:
+            while True:
+                with self._cv:
+                    while (not self._items and not self._closing
+                           and not self._aborted):
+                        self._cv.wait()
+                    if self._aborted or not self._items:
+                        break           # told to stop, or closed and drained
+                    data = self._items[0][0]
+                self._write_all(data)
+                with self._cv:
+                    self._items.popleft()
+                self._notify(None)
+        except Exception as e:
+            failure = e
+        finally:
+            with self._cv:
+                self._ended = True
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+        if failure is not None and not self._aborted:
+            self._notify(failure)
+
+
 class _Reader(threading.Thread):
     """Pump lines from a binary stream into a queue as (tag, line);
     (tag, None) marks EOF or a broken pipe."""
@@ -791,14 +1176,28 @@ def _spawn(server_cmd: list[str]):
     return proc
 
 
+def _kill(proc) -> None:
+    """End the server now, without asking: a server that has stopped reading
+    is not going to act on a polite request, and only its death ends a write
+    that is blocked on its pipe."""
+    try:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
 def _stop(proc) -> None:
     """Stop the server and reap it (no zombies, no ResourceWarning).
 
     Portable: terminate()/kill() only - no killpg, no SIGKILL. Our end of
-    its stdin is closed first (EOF lets a well-behaved server exit on its
-    own); its stdout is closed last, after the process is gone, so a
-    reader thread still blocked in readline() sees EOF instead of a
-    close() that waits on the buffer lock.
+    its stdin is closed first; a session that ended well has given the server
+    its --grace to leave on its own before it gets here (_Proxy._wind_down),
+    so a server still running now is sent SIGTERM and, if that is ignored for
+    _TERM_WAIT seconds, killed. Its stdout is closed last, after the process
+    is gone, so a reader thread still blocked in readline() sees EOF instead
+    of a close() that waits on the buffer lock.
     """
     try:
         if proc.stdin:
@@ -809,7 +1208,7 @@ def _stop(proc) -> None:
         if proc.poll() is None:
             proc.terminate()
             try:
-                proc.wait(timeout=5)
+                proc.wait(timeout=_TERM_WAIT)
             except subprocess.TimeoutExpired:
                 proc.kill()
                 proc.wait(timeout=5)
@@ -842,6 +1241,26 @@ def _no_constants(name):
     raise ValueError(f"{name} is not valid JSON")
 
 
+# A message is ONE compact line. JSON allows a control character outside a
+# string only as whitespace, and a bare CR (or TAB, VT, FF...) there is how
+# a line smuggles a second message past a reader that ends lines on CR
+# (Java's BufferedReader.readLine, Python's universal newlines).
+_CONTROL = re.compile(r"[\x00-\x1f]")
+
+
+class _Unrepresentable(ValueError):
+    pass
+
+
+def _finite_float(text: str) -> float:
+    """parse_float hook: 1e999 would become inf, which JSON cannot carry
+    and the jail could neither check nor forward faithfully."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise _Unrepresentable(f"number out of range: {text[:30]}")
+    return value
+
+
 def _parse(line: bytes):
     """Decode one wire line. Returns (obj, None, "") on success,
     (None, None, "") for a blank line, else (None, rpc_code, text)."""
@@ -849,18 +1268,27 @@ def _parse(line: bytes):
         text = line.decode("utf-8")
     except UnicodeDecodeError as e:
         return None, PARSE_ERROR, f"invalid UTF-8: {e.reason}"
-    text = text.strip()
-    if not text:
+    # the reader ended the line with exactly one "\n"; the rest is the message
+    body = text[:-1] if text.endswith("\n") else text
+    if not body.strip(" "):
         return None, None, ""  # blank line: protocol noise
     try:
-        return (json.loads(text, object_pairs_hook=_no_duplicate_keys,
-                           parse_constant=_no_constants), None, "")
-    except _DuplicateKey as e:
+        obj = json.loads(body, object_pairs_hook=_no_duplicate_keys,
+                         parse_constant=_no_constants,
+                         parse_float=_finite_float)
+    except (_DuplicateKey, _Unrepresentable) as e:
+        # well-formed JSON that the jail will not carry: its id is known
         return None, INVALID_REQUEST, str(e)
     except RecursionError:
         return None, PARSE_ERROR, "invalid JSON: nesting too deep"
     except ValueError as e:
         return None, PARSE_ERROR, f"invalid JSON: {e}"
+    bad = _CONTROL.search(body)
+    if bad:
+        return None, INVALID_REQUEST, (
+            f"raw control character U+{ord(bad.group()):04X} in the message "
+            f"line (a message is one compact JSON line)")
+    return obj, None, ""
 
 
 class _Pending:
@@ -928,16 +1356,22 @@ class _Proxy:
     from a single queue and is the only writer to either side."""
 
     def __init__(self, proc, client_in, client_out, timeout: float | None,
-                 pol: dict | None, observer=None):
+                 pol: dict | None, observer=None, grace: float = DEFAULT_GRACE):
         self.proc = proc
+        self.grace = grace
         self.q: "queue.Queue" = queue.Queue()
         self.client = _Writer(client_out)
-        self.server = _Writer(proc.stdin)
         self.timeout = timeout if timeout and timeout > 0 else None
+        self.server = _ServerInput(proc.stdin, self.timeout,
+                                   lambda payload: self.q.put(("input", payload)))
         self.pol = pol
         self.observer = observer
         self.pending = _Pending()
         self._client_in = _binary_in(client_in)
+        # why the server is lost (it exited, closed its input, stopped
+        # reading it), and how many requests it left unanswered past --timeout
+        self.lost: "str | None" = None
+        self.timed_out = 0
 
     # -- helpers ----------------------------------------------------------
 
@@ -950,16 +1384,34 @@ class _Proxy:
     def _deadline(self) -> float | None:
         return (time.monotonic() + self.timeout) if self.timeout else None
 
-    def _forward(self, msg: dict, raw: bytes | None = None) -> None:
-        if raw is not None and not raw.endswith(b"\n"):
-            raw = raw + b"\n"
-        self.server.write(raw if raw is not None else _encode(msg))
+    def _forward(self, msg: dict, req_id=None, has_id: bool = False) -> bool:
+        """Send `msg` to the server in its canonical encoding (see _encode).
+        False, after telling the client, when it cannot be encoded."""
+        try:
+            data = _encode(msg)
+        except (RecursionError, ValueError):
+            if has_id:
+                self.client.send(_rpc_error(req_id, INVALID_REQUEST,
+                                            "Invalid Request: nesting too "
+                                            "deep"))
+            self._audit_rejected("client", "nesting too deep", msg)
+            return False
+        if not self.server.put(data):
+            # its stdin is gone (the writer has ended): nothing more can be
+            # sent, so everything still owed is answered now
+            if has_id:
+                self.client.send(_rpc_error(req_id, INTERNAL_ERROR,
+                                            "server closed"))
+            self._lose("closed its input", "server closed")
+            return False
+        return True
 
     def _audit(self, name, args, ok: bool, reason: str,
                method: str = "tools/call") -> None:
-        event = {"tool": name if isinstance(name, str) else repr(name),
-                 "decision": "allow" if ok else "deny", "reason": reason}
-        if method != "tools/call":
+        event = {"decision": "allow" if ok else "deny", "reason": reason}
+        if name is not None:  # None: nothing in params said what it was for
+            event["tool"] = name if isinstance(name, str) else repr(name)
+        if method != "tools/call" or name is None:
             event["method"] = method
         mode = self.pol.get("audit_args", "denied")
         if mode == "all" or (mode == "denied" and not ok):
@@ -968,11 +1420,36 @@ class _Proxy:
 
     # -- client -> server ---------------------------------------------------
 
+    def _audit_rejected(self, side: str, why: str, subject=None,
+                        method=None) -> None:
+        """The record of a message the jail would not relay, from `side`
+        ("client" or "server"): whatever it was, it is on the record."""
+        event = {"decision": "deny", "rejected": side, "reason": why}
+        if isinstance(method, str):
+            event["method"] = method
+        mode = (self.pol or {}).get("audit_args", "denied")
+        if subject is not None and mode != "none":
+            event["message"] = _clip(subject)
+        audit(event)
+
+    def _refuse(self, why: str, code: int = INVALID_REQUEST, req_id=None,
+                reply: bool = True, subject=None, method=None) -> None:
+        """Turn one client message away: an error under its id (null when
+        there is none to trust) unless it was a notification, and an audit
+        record either way. `subject` is the wire line (bytes), from which
+        an id is recovered when it has one, or the parsed object."""
+        if reply:
+            if req_id is None and isinstance(subject, bytes):
+                salvaged = _salvage_id(subject)
+                req_id = None if salvaged is _NO_ID else salvaged
+            prefix = "Parse error" if code == PARSE_ERROR else "Invalid Request"
+            self.client.send(_rpc_error(req_id, code, f"{prefix}: {why}"))
+        self._audit_rejected("client", why, subject, method)
+
     def _on_client_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
         if code is not None:
-            prefix = "Parse error" if code == PARSE_ERROR else "Invalid Request"
-            self.client.send(_rpc_error(None, code, f"{prefix}: {err}"))
+            self._refuse(err, code, subject=line)
             return
         if msg is None:
             return  # blank line
@@ -980,40 +1457,52 @@ class _Proxy:
             # JSON-RPC batch: split it. Each element is handled on its
             # own; the server answers forwarded elements individually.
             if not msg:
-                self.client.send(_rpc_error(None, INVALID_REQUEST,
-                                            "Invalid Request: empty batch"))
+                self._refuse("empty batch", subject=line)
                 return
             for item in msg:
-                self._on_client_message(item, None)
+                self._on_client_message(item)
             return
-        self._on_client_message(msg, line)
+        self._on_client_message(msg)
 
-    def _on_client_message(self, msg, raw: bytes | None) -> None:
+    def _on_client_message(self, msg) -> None:
         if not isinstance(msg, dict):
-            self.client.send(_rpc_error(None, INVALID_REQUEST,
-                                        "Invalid Request: not an object"))
+            self._refuse("not an object", subject=msg)
+            return
+        bad = _key_clash(msg, _ENVELOPE_KEYS)
+        if bad is not None:
+            self._refuse(_clash_text(bad), req_id=msg.get("id"), subject=msg)
             return
         if "method" not in msg:
-            # A response from the client to a server-originated request
-            # (sampling, roots, elicitation): pass through untouched.
-            self._forward(msg, raw)
+            # The client's answer to a request the server made of it
+            # (sampling, roots, elicitation): relayed when it is one, an
+            # id and exactly one of result / error.
+            if "id" not in msg or ("result" in msg) == ("error" in msg):
+                self._refuse("a response needs an id and exactly one of "
+                             "result and error", req_id=msg.get("id"),
+                             subject=msg)
+                return
+            self._forward(msg, msg["id"], True)
             return
         method = msg.get("method")
         has_id = "id" in msg
         req_id = msg.get("id")
+        if "result" in msg or "error" in msg:
+            self._refuse("a message with a method must not carry a result "
+                         "or an error", req_id=req_id, reply=has_id,
+                         subject=msg)
+            return
         if has_id and req_id is None:
             # MCP: "the request ID MUST NOT be null". Answer, don't drop.
-            self.client.send(_rpc_error(None, INVALID_REQUEST,
-                                        "Invalid Request: id must not be "
-                                        "null"))
+            self._refuse("id must not be null", subject=msg)
             return
         if not isinstance(method, str):
-            if has_id:
-                self.client.send(_rpc_error(req_id, INVALID_REQUEST,
-                                            "Invalid Request: method must "
-                                            "be a string"))
+            self._refuse("method must be a string", req_id=req_id,
+                         reply=has_id, subject=msg)
             return
         call = None
+        # the method as a parser that ignores case would route it: what the
+        # rest of the proxy goes by (tools/list responses, learn's observer)
+        mkey = normalize_tool_name(method)
         if self.pol is not None and method_denied(self.pol, method):
             reason = f"method '{method}' is denied by policy"
             audit({"method": method, "decision": "deny", "reason": reason})
@@ -1021,20 +1510,25 @@ class _Proxy:
                 self.client.send(_rpc_error(req_id, METHOD_NOT_FOUND,
                                             f"mcp-jail denied: {reason}"))
             return
-        if (method == "tools/call" if self.pol is None
+        if (mkey == "tools/call" if self.pol is None
                 else method_policed(self.pol, method)):
             params = msg.get("params")
             params = params if isinstance(params, dict) else {}
-            name = params.get("name")
-            if name is None and method != "tools/call":
-                name = params.get("uri")  # resources/read, resources/subscribe
             targs = params.get("arguments")
             if targs is None:
                 targs = {}
-            if self.pol is None:
+            clash = _key_clash(params, _PARAM_KEYS)
+            if clash is not None:
+                name, why = None, "params: " + _clash_text(clash)
+            else:
+                name, why = _selected(mkey, params)
+            if why is not None:
+                ok, reason = False, why
+            elif self.pol is None:
                 ok, reason = True, ""
             else:
                 ok, reason = tool_allowed(self.pol, name, targs)
+            if self.pol is not None:
                 self._audit(name, targs, ok, reason, method)
             if not ok:
                 # Same id, same type, as the request. A notification
@@ -1043,40 +1537,42 @@ class _Proxy:
                     self.client.send(_rpc_error(req_id, INVALID_PARAMS,
                                                 f"mcp-jail denied: {reason}"))
                 return
-            if self.observer is not None and has_id and method == "tools/call":
+            if self.observer is not None and has_id and mkey == "tools/call":
                 call = (name, targs)  # recorded once the server succeeds
-            # The server gets the object the policy checked, re-encoded:
-            # never the client's bytes, whose parse it might disagree on.
-            raw = None
-        try:
-            self._forward(msg, raw)
-        except RecursionError:
-            if has_id:
-                self.client.send(_rpc_error(req_id, INVALID_REQUEST,
-                                            "Invalid Request: nesting too "
-                                            "deep"))
+        if not self._forward(msg, req_id, has_id):
             return
         if has_id:
-            self.pending.add(req_id, method, self._deadline(), call=call)
+            self.pending.add(req_id, mkey, self._deadline(), call=call)
 
     # -- server -> client ---------------------------------------------------
+
+    def _refuse_server(self, why: str, rid=_NO_ID, subject=None) -> None:
+        """A message from the server the jail will not relay. When it
+        answers a request we know of (`rid`), that request fails closed;
+        either way it is logged and on the audit record."""
+        entry = self.pending.pop(rid) if rid is not _NO_ID else None
+        if entry is not None:
+            self.client.send(_rpc_error(entry["id"], INTERNAL_ERROR,
+                                        f"bad response from server: {why}"))
+        else:
+            self._log(f"dropping a message from the server: {why}")
+        self._audit_rejected("server", why, subject)
 
     def _on_server_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
         if code is not None:
-            # Not a JSON-RPC frame. npm servers console.log() banners and
-            # progress onto stdout; such a line answers nothing, so it is
-            # logged and skipped -- never charged to a pending request,
-            # whose real answer would then be dropped. A request the
-            # server never answers is still caught by --timeout. A JSON
-            # document refused for duplicate keys IS a response: the
-            # request it names (by id) fails closed.
-            rid = _lenient_id(line) if code == INVALID_REQUEST else _NO_ID
-            entry = self.pending.pop(rid) if rid is not _NO_ID else None
-            if entry is not None:
-                self.client.send(_rpc_error(entry["id"], INTERNAL_ERROR,
-                                            f"bad response from server: {err}"))
+            if code == INVALID_REQUEST:
+                # JSON the jail will not relay (duplicate keys, a raw
+                # control character): a request it answers fails closed by
+                # its id instead of waiting for --timeout.
+                self._refuse_server(err, _lenient_id(line), line)
             else:
+                # Not a JSON-RPC frame. npm servers console.log() banners
+                # and progress onto stdout; such a line answers nothing, so
+                # it is logged and skipped -- never charged to a pending
+                # request, whose real answer would then be dropped. A
+                # request the server never answers is still caught by
+                # --timeout.
                 self._log(f"ignoring non-JSON line from server: "
                           f"{_preview(line)}")
             return
@@ -1086,38 +1582,54 @@ class _Proxy:
             # A batch response: deliver it once, as one array, keeping
             # the elements that survive (filtered tools/list pages and
             # all).
-            kept = [m for m in msg if self._on_server_message(m) is not None]
+            kept = [m for m in msg if self._on_server_message(m)]
             if kept:
-                self.client.send(kept)
+                self._deliver(kept)
             return
-        how = self._on_server_message(msg)
-        if how == "raw":
-            self.client.write(line)
-        elif how == "obj":
-            try:
-                self.client.send(msg)
-            except RecursionError:
-                self.client.send(_rpc_error(msg.get("id"), INTERNAL_ERROR,
-                                            "bad response from server"))
+        if self._on_server_message(msg):
+            self._deliver(msg)
 
-    def _on_server_message(self, msg) -> str | None:
-        """Decide one server message: None = drop, "raw" = deliver the
-        wire bytes untouched, "obj" = deliver the (modified) object. The
-        caller writes, so a batch is written once, not per element."""
+    def _deliver(self, obj) -> None:
+        """Write one server message (or batch) to the client, re-encoded."""
+        try:
+            data = _encode(obj)
+        except (RecursionError, ValueError):
+            rid = obj.get("id") if isinstance(obj, dict) else None
+            self.client.send(_rpc_error(rid, INTERNAL_ERROR,
+                                        "bad response from server"))
+            return
+        self.client.write(data)
+
+    def _on_server_message(self, msg) -> bool:
+        """Decide one server message: False = drop, True = deliver the
+        object (modified in place when a tools/list page was filtered)."""
         if not isinstance(msg, dict):
-            return None
+            return False
+        bad = _key_clash(msg, _ENVELOPE_KEYS)
+        if bad is not None:
+            self._refuse_server(_clash_text(bad), msg.get("id", _NO_ID), msg)
+            return False
         if "method" in msg:
+            if "result" in msg or "error" in msg:
+                self._refuse_server("a message with a method also carries a "
+                                    "result or an error", msg.get("id", _NO_ID),
+                                    msg)
+                return False
             # Server-originated request or notification: pass through.
-            return "raw"
+            return True
         if "id" not in msg:
             self._log("ignoring server message with neither method nor id")
-            return None
+            return False
+        if ("result" in msg) == ("error" in msg):
+            self._refuse_server("a response needs exactly one of result and "
+                                "error", msg["id"], msg)
+            return False
         entry = self.pending.pop(msg.get("id"))
         if entry is None:
             # Late (already timed out) or unsolicited: the client already
             # has its answer for this id, a second one would confuse it.
             self._log(f"dropping response with unknown id {msg.get('id')!r}")
-            return None
+            return False
         if entry["method"] == "tools/call" and entry.get("call") is not None:
             if self.observer is not None and _call_succeeded(msg):
                 self.observer.on_call(*entry["call"])
@@ -1125,15 +1637,53 @@ class _Proxy:
             if self.observer is not None:
                 self.observer.on_tools(msg["result"])
             if self.pol is not None and self.pol.get("hide_denied", True):
-                filter_tools_list(self.pol, msg["result"])
-                return "obj"  # re-serialise the filtered page
-        return "raw"
+                result = msg["result"]
+                bad = (_key_clash(result, ("tools", "nextCursor"))
+                       if isinstance(result, dict) else None)
+                if bad is not None:
+                    # a second spelling of `tools` is a list this filter
+                    # never saw: the request fails instead
+                    why = _clash_text(bad)
+                    self.client.send(_rpc_error(
+                        entry["id"], INTERNAL_ERROR,
+                        f"bad response from server: {why}"))
+                    self._audit_rejected("server", why, msg)
+                    return False
+                filter_tools_list(self.pol, result)
+        return True
 
     # -- loop ---------------------------------------------------------------
 
     def _fail_pending(self, entries, message: str) -> None:
         for e in entries:
             self.client.send(_rpc_error(e["id"], INTERNAL_ERROR, message))
+
+    def _lose(self, why: str, message: str) -> None:
+        """The server is gone or no use any more: answer everything it owes
+        and remember why (the loop ends, the exit code says so)."""
+        if self.lost is None:
+            self.lost = why
+        self._fail_pending(self.pending.drain(), message)
+
+    def _check_deadlines(self) -> "float | None":
+        """Act on whatever is overdue; seconds until the next deadline (None:
+        nothing is due, wait for traffic). Looked at on every pass, not only
+        when the queue happens to be idle, so a server that keeps the queue
+        busy cannot keep --timeout from firing."""
+        now = time.monotonic()
+        if self.server.stalled(now):
+            self._lose(f"stopped reading its input (no message taken within "
+                       f"{self.timeout:g}s)",
+                       f"server stopped reading its input (timed out after "
+                       f"{self.timeout:g}s)")
+            return None
+        expired = self.pending.expired(now)
+        if expired:
+            self.timed_out += len(expired)
+            self._fail_pending(expired, "server timed out")
+        due = [d for d in (self.pending.next_deadline(),
+                           self.server.stall_deadline()) if d is not None]
+        return max(0.0, min(due) - now) if due else None
 
     def _handle(self, handler, line: bytes) -> None:
         """One line through its handler. A pipe going away ends the loop
@@ -1146,55 +1696,151 @@ class _Proxy:
         except Exception as e:
             self._log(f"internal error on one message, dropped: {e!r}")
 
+    def _server_status(self) -> str:
+        """" (exit status N)" for a server that has just closed its output,
+        given a moment to finish exiting; "" if it is still running."""
+        try:
+            code = self.proc.wait(timeout=1)
+        except (OSError, subprocess.TimeoutExpired):
+            return ""
+        return f" (exit status {code})"
+
+    def _end_input(self) -> None:
+        """Stop the writer thread. A server that is lost is killed first:
+        that is what ends a write blocked on its full pipe."""
+        if self.lost is not None:
+            _kill(self.proc)
+            self.server.abort()
+        else:
+            self.server.close()
+        self.server.join(2.0)
+
+    def _wind_down(self) -> None:
+        """The client has gone and nothing is owed. Do what the MCP stdio
+        transport asks of a client that is leaving: close the server's input
+        (it reads end of file), then give it --grace seconds to finish what
+        it was sent and exit. Whatever it says meanwhile - a last answer, a
+        goodbye notification - goes through the same checks as ever. A server
+        still there at the end is stopped by _stop(): SIGTERM, then a kill."""
+        self.server.close()
+        self.server.join(2.0)       # nothing is queued: this is the thread leaving
+        try:
+            self.proc.stdin.close()     # the thread has closed its own descriptor
+        except OSError:
+            pass
+        deadline = time.monotonic() + self.grace
+        out_open = True
+        while True:
+            now = time.monotonic()
+            if now >= deadline:
+                if self.proc.poll() is None:
+                    self._log(f"server did not exit within {self.grace:g}s of "
+                              f"its input closing; stopping it")
+                else:
+                    # gone, but a process it started still has its output
+                    # open, and _stop() cannot close the pipe under a reader
+                    self._log("server has exited, but something it started "
+                              "still has its output open; waiting for that "
+                              "to let go")
+                return
+            if not out_open:
+                # everything it wrote has been relayed: only its exit is left
+                try:
+                    self.proc.wait(timeout=min(deadline - now, 0.05))
+                    return
+                except subprocess.TimeoutExpired:
+                    continue
+                except OSError:
+                    return
+            try:
+                tag, line = self.q.get(timeout=min(deadline - now, 0.05))
+            except queue.Empty:
+                continue
+            if tag == "server":     # not the writer's receipts
+                if line is None:
+                    out_open = False
+                else:
+                    self._handle(self._on_server_line, line)
+
     def serve(self) -> int:
+        """Relay until the client is done and everything is answered, then
+        wind the server down (see _wind_down), or until the server is lost.
+        Returns 0 for a clean session, EXIT_SERVER when the server exited or
+        closed its pipes while the client was still talking to it, stopped
+        reading its input, or left a request unanswered past --timeout."""
         _Reader(self._client_in, "client", self.q).start()
         _Reader(self.proc.stdout, "server", self.q).start()
+        self.server.start()
         client_open = True
         try:
             while True:
-                if not client_open and not len(self.pending):
+                wait = self._check_deadlines()
+                if self.lost is not None:
                     break
-                deadline = self.pending.next_deadline()
-                wait = None
-                if deadline is not None:
-                    wait = max(0.0, deadline - time.monotonic())
+                if (not client_open and not len(self.pending)
+                        and not self.server.busy()):
+                    if not self.timed_out and self.grace > 0:
+                        self._wind_down()
+                    break
                 try:
-                    tag, line = self.q.get(timeout=wait)
+                    tag, line = self.q.get(
+                        timeout=None if wait is None else min(wait, _MAX_BLOCK))
                 except queue.Empty:
-                    self._fail_pending(self.pending.expired(time.monotonic()),
-                                       "server timed out")
                     continue
                 if tag == "client":
                     if line is None:
                         client_open = False
                         continue
                     self._handle(self._on_client_line, line)
+                elif tag == "input":
+                    if line is not None:    # writing failed: its stdin is gone
+                        self._lose(f"closed its input ({line})", "server closed")
+                        break
                 else:
                     if line is None:
-                        self._fail_pending(self.pending.drain(),
-                                           "server closed")
+                        # the server's stdout closed: it exited, or shut its
+                        # pipes. A session whose client had finished and
+                        # was owed nothing never gets here.
+                        self._lose("exited or closed its output"
+                                   + self._server_status(), "server closed")
                         break
                     self._handle(self._on_server_line, line)
         except (BrokenPipeError, KeyboardInterrupt):
             pass
         except (OSError, ValueError) as e:  # a pipe went away under us
             self._log(f"transport closed: {e}")
-        return 0
+        finally:
+            if self.lost is not None:
+                self._log(f"server {self.lost}")
+            self._end_input()
+        return EXIT_SERVER if (self.lost is not None or self.timed_out) else 0
 
 
 def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
-        stdin=None, stdout=None) -> int:
+        stdin=None, stdout=None, grace: float = DEFAULT_GRACE) -> int:
     """Run the jail: policy-check stdin -> server, pass server -> stdout.
 
     `stdin`/`stdout` default to the process's own (binary) streams; tests
-    pass in-memory streams.
+    pass in-memory streams. `grace` is how long the server is given to leave
+    on its own once the client has gone (0: not at all).
     """
+    problem = _refuse_seconds(timeout=timeout, grace=grace)
+    if problem:
+        sys.stderr.write(f"mcp-jail: {problem}\n")
+        return 2
     policy_path = expand_path(policy_path)
     try:
         pol = load_policy(policy_path)
     except FileNotFoundError:
         sys.stderr.write(f"mcp-jail: no policy at {policy_path}\n"
                          f"mcp-jail: create one - see README\n")
+        return 2
+    except OSError as e:        # a directory, no permission, ...
+        sys.stderr.write(f"mcp-jail: cannot read the policy "
+                         f"{policy_path}: {e}\n")
+        return 2
+    except RecursionError:
+        sys.stderr.write("mcp-jail: bad policy: nested too deeply\n")
         return 2
     except (json.JSONDecodeError, re.error, ValueError) as e:
         sys.stderr.write(f"mcp-jail: bad policy: {e}\n")
@@ -1207,7 +1853,7 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
         return 2
     try:
         return _Proxy(proc, stdin or sys.stdin, stdout or sys.stdout,
-                      timeout, pol).serve()
+                      timeout, pol, grace=grace).serve()
     finally:
         _stop(proc)
 
@@ -1388,7 +2034,10 @@ class _Session:
     def __init__(self, proc):
         self.proc = proc
         self.q: "queue.Queue" = queue.Queue()
-        self.out = _Writer(proc.stdin)
+        # no stall timer of its own: request() waits with its own deadline
+        self.out = _ServerInput(proc.stdin, None,
+                                lambda payload: self.q.put(("input", payload)))
+        self.out.start()
         self.closed = False
         _Reader(proc.stdout, "server", self.q).start()
 
@@ -1397,28 +2046,38 @@ class _Session:
         when the server has gone (its stdin pipe is closed)."""
         if self.closed:
             return False
-        try:
-            self.out.send(msg)
-        except OSError:
+        if not self.out.put(_encode(msg)):
             self.closed = True
             return False
         return True
+
+    def close(self) -> None:
+        """Stop the writer thread (a blocked write ends when the server is
+        stopped)."""
+        self.out.abort()
 
     def request(self, msg: dict, timeout: float):
         if not self.notify(msg):
             return ("closed",)
         want = _id_key(msg.get("id"))
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + timeout if timeout else None  # 0: no limit
         while True:
             if self.closed:
                 return ("closed",)
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return ("timeout",)
+            remaining = _MAX_BLOCK
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return ("timeout",)
             try:
-                _tag, line = self.q.get(timeout=remaining)
+                tag, line = self.q.get(timeout=min(remaining, _MAX_BLOCK))
             except queue.Empty:
-                return ("timeout",)
+                continue            # the deadline, if any, is checked above
+            if tag == "input":
+                if line is not None:    # writing failed: its stdin is gone
+                    self.closed = True
+                    return ("closed",)
+                continue                # a message went out
             if line is None:
                 self.closed = True
                 return ("closed",)
@@ -1469,6 +2128,14 @@ def _learn_from_script(proc, calls: list[dict], timeout: float,
     None when the script ran through, else why the session ended early
     (the server refused initialize, or went away)."""
     session = _Session(proc)
+    try:
+        return _drive_script(session, calls, timeout, rec)
+    finally:
+        session.close()
+
+
+def _drive_script(session: _Session, calls: list[dict], timeout: float,
+                  rec: _Recorder) -> str | None:
     status = session.request(
         {"jsonrpc": "2.0", "id": "learn-init", "method": "initialize",
          "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
@@ -1530,7 +2197,7 @@ def _learn_from_script(proc, calls: list[dict], timeout: float,
 
 def learn(server_cmd: list[str], script: str | None = None,
           out: str | None = None, timeout: float = 30.0,
-          stdin=None, stdout=None) -> int:
+          stdin=None, stdout=None, grace: float = DEFAULT_GRACE) -> int:
     """Observe a server and emit a tight-fit allowlist policy.
 
     --script mode drives canned calls against the server (no client).
@@ -1543,6 +2210,10 @@ def learn(server_cmd: list[str], script: str | None = None,
     handshake, server gone): whatever was learned by then goes to stdout
     for review instead, so a failed run never overwrites a good policy.
     """
+    problem = _refuse_seconds(timeout=timeout, grace=grace)
+    if problem:
+        print(f"mcp-jail learn: {problem}", file=sys.stderr)
+        return 2
     calls: list[dict] = []
     if script is not None:
         script = expand_path(script)
@@ -1579,11 +2250,14 @@ def learn(server_cmd: list[str], script: str | None = None,
         if script is not None:
             failure = _learn_from_script(proc, calls, timeout, rec)
         else:
+            proxy = _Proxy(proc, stdin or sys.stdin, stdout or sys.stdout,
+                           timeout, None, observer=rec, grace=grace)
             try:
-                _Proxy(proc, stdin or sys.stdin, stdout or sys.stdout,
-                       timeout, None, observer=rec).serve()
+                proxy.serve()
             except KeyboardInterrupt:
                 pass
+            if proxy.lost is not None:
+                failure = f"the server {proxy.lost} during the session"
     finally:
         _stop(proc)
     policy = generate_policy(rec.tools, rec.calls)

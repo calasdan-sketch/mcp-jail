@@ -76,6 +76,20 @@ def _harden_streams() -> None:
             pass
 
 
+def _seconds(text: str) -> float:
+    """argparse type for --timeout: a finite number of seconds, 0 or more.
+    float() alone takes "nan" and "inf" and a minus sign."""
+    try:
+        value = float(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a number of seconds") from None
+    why = jail_mod.seconds_problem(value)
+    if why is not None:
+        raise argparse.ArgumentTypeError(f"{text!r} {why}")
+    return value
+
+
 def cmd_init_policy(args) -> int:
     path = jail_mod.expand_path(args.path)
     if os.path.exists(path) and not args.force:
@@ -89,26 +103,49 @@ def cmd_init_policy(args) -> int:
     return 0
 
 
+def _plain(value) -> str:
+    """A field of an audit record as one line of printable text. The log is
+    JSON, so a newline, a terminal escape or a bidi override inside a reason
+    (or a tool name: the client chooses it) is harmless there; printed as it
+    is, it would forge lines in the report and drive the terminal. Whatever is
+    not printable is shown as its escape: \\n, \\x1b, \\u202e."""
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        try:
+            value = json.dumps(value)
+        except (TypeError, ValueError):
+            value = repr(value)
+    return "".join(ch if ch.isprintable()
+                   else ch.encode("unicode_escape").decode("ascii")
+                   for ch in value)
+
+
 def cmd_audit(args) -> int:
     path = jail_mod.audit_log_path()
     if not os.path.exists(path):
         print("no audit log yet.")
         return 0
     denies = 0
-    with open(path, encoding="utf-8") as f:
+    with open(path, encoding="utf-8", errors="replace") as f:
         lines = f.readlines()[-args.limit:]
     for ln in lines:
         try:
             e = json.loads(ln)
-        except ValueError:
+        except (ValueError, RecursionError):
             continue
-        mark = "DENY " if e.get("decision") == "deny" else "allow"
-        if e.get("decision") == "deny":
-            denies += 1
+        if not isinstance(e, dict):
+            continue
+        denied = e.get("decision") == "deny"
+        denies += denied
+        mark = "DENY " if denied else "allow"
         what = e.get("tool")
-        if what is None:  # a whole method refused by deny_methods
-            what = f"method {e.get('method')}"
-        print(f"{mark} {what} {e.get('reason', '')}")
+        if what is None:
+            if e.get("rejected") is not None:  # a message the jail would not relay
+                what = f"{_plain(e['rejected'])} message"
+            else:  # a whole method refused by deny_methods
+                what = f"method {_plain(e.get('method'))}"
+        print(f"{mark} {_plain(what)} {_plain(e.get('reason', ''))}")
     print(f"\n{denies} denied in last {len(lines)} calls")
     return 0
 
@@ -127,9 +164,13 @@ def cmd_learn(argv: list[str]) -> int:
                    help="JSON array of {\"tool\": name, "
                         "\"arguments\": {...}} to drive against the server")
     p.add_argument("--out", help="write the policy here (default: stdout)")
-    p.add_argument("--timeout", type=float, default=30.0,
+    p.add_argument("--timeout", type=_seconds, default=30.0,
                    help="seconds to wait for each server response "
-                        "(default: 30)")
+                        "(default: 30; 0 waits for ever)")
+    p.add_argument("--grace", type=_seconds, default=jail_mod.DEFAULT_GRACE,
+                   help="live mode: seconds to give the server to exit on "
+                        "its own once stdin has ended, before it is sent "
+                        "SIGTERM (default: 5; 0 stops it at once)")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
                         "mcp-jail learn --script c.json -- <cmd>")
@@ -143,7 +184,7 @@ def cmd_learn(argv: list[str]) -> int:
               file=sys.stderr)
         return 2
     return jail_mod.learn(cmd, script=args.script, out=args.out,
-                          timeout=args.timeout)
+                          timeout=args.timeout, grace=args.grace)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -151,7 +192,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="mcp-jail", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="subcommand: mcp-jail learn --help")
+        epilog="subcommand: mcp-jail learn --help\n\n"
+               "exit status: 0 a clean session; 2 an unusable policy or "
+               "command; 3 the server failed (it exited or closed its pipes, "
+               "stopped reading its input, or did not answer a request "
+               "within --timeout)")
     p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
     p.add_argument("--policy", default=default_policy, metavar="FILE",
                    help=f"policy file; ~ and environment variables are "
@@ -170,9 +215,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=50, metavar="N",
                    help="how many audit entries --audit shows "
                         "(default: 50)")
-    p.add_argument("--timeout", type=float, default=30.0, metavar="SECS",
-                   help="seconds to wait for each server response "
-                        "(default: 30)")
+    p.add_argument("--timeout", type=_seconds, default=30.0, metavar="SECS",
+                   help="seconds to wait for each server response, and for "
+                        "the server to take each message off its stdin "
+                        "(default: 30; 0 waits for ever)")
+    p.add_argument("--grace", type=_seconds, default=jail_mod.DEFAULT_GRACE,
+                   metavar="SECS",
+                   help="seconds to give the server to finish and exit on "
+                        "its own once the client's input has ended and every "
+                        "request is answered; then it is sent SIGTERM, and "
+                        "killed if it ignores that (default: 5; 0 stops it "
+                        "at once)")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
                         "mcp-jail --policy p.json -- npx -y srv")
@@ -194,7 +247,8 @@ def _main(argv: list[str]) -> int:
         print("error: no server command: mcp-jail --policy p.json -- <cmd>",
               file=sys.stderr)
         return 2
-    return jail_mod.run(args.policy, cmd, timeout=args.timeout)
+    return jail_mod.run(args.policy, cmd, timeout=args.timeout,
+                        grace=args.grace)
 
 
 def main(argv=None) -> int:

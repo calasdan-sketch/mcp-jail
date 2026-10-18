@@ -58,6 +58,9 @@ def setUpModule():
     for var in _ENV_VARS:
         _saved_env[var] = os.environ.get(var)
         os.environ[var] = _fake_home
+    # servers the jail starts in this process inherit the environment: one
+    # that forgot to flush must hang here as it would for a real client
+    _saved_env["PYTHONUNBUFFERED"] = os.environ.pop("PYTHONUNBUFFERED", None)
 
 
 def tearDownModule():
@@ -71,6 +74,15 @@ def tearDownModule():
 
 def mktemp() -> str:
     return tempfile.mkdtemp(prefix="mj")
+
+
+def child_env() -> dict:
+    """Environment for a real subprocess running mcp-jail. This sandbox sets
+    PYTHONUNBUFFERED, which hides a child that forgot to flush: drop it."""
+    env = dict(os.environ)
+    env.pop("PYTHONUNBUFFERED", None)
+    env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+    return env
 
 
 # --------------------------------------------------------------------------
@@ -276,26 +288,37 @@ ALLOW_ALL = {"allow_tools": ["*"], "deny_tools": [], "arg_rules": {},
              "hide_denied": False}
 
 
-def drive_raw(policy_path: str, server_cmd: list, requests, timeout: float = 30.0,
-              join: float = 20) -> list[bytes]:
-    """Run the jail in-process on in-memory streams; return raw output
-    lines. `requests` may be dicts (serialised) or raw strings."""
+def drive_rc(policy_path: str, server_cmd: list, requests, timeout: float = 30.0,
+             join: float = 20, grace=None) -> tuple:
+    """Run the jail in-process on in-memory streams; return (exit code, raw
+    output lines). `requests` may be dicts (serialised) or raw strings.
+    `grace` is passed on only when given (the jail's default otherwise)."""
     chunks = []
     for r in requests:
         chunks.append(r if isinstance(r, str) else json.dumps(r))
     inp = io.BytesIO(("\n".join(chunks) + "\n").encode("utf-8"))
     out = io.BytesIO()
+    code = []
+
+    extra = {} if grace is None else {"grace": grace}
 
     def target():
-        jail_mod.run(policy_path, server_cmd, timeout=timeout,
-                     stdin=inp, stdout=out)
+        code.append(jail_mod.run(policy_path, server_cmd, timeout=timeout,
+                                 stdin=inp, stdout=out, **extra))
 
     t = threading.Thread(target=target, daemon=True)
     t.start()
     t.join(timeout=join)
     if t.is_alive():
         raise AssertionError("proxy did not finish (hung?)")
-    return [ln for ln in out.getvalue().split(b"\n") if ln.strip()]
+    return (code[0] if code else None,
+            [ln for ln in out.getvalue().split(b"\n") if ln.strip()])
+
+
+def drive_raw(policy_path: str, server_cmd: list, requests, timeout: float = 30.0,
+              join: float = 20) -> list[bytes]:
+    """drive_rc without the exit code."""
+    return drive_rc(policy_path, server_cmd, requests, timeout, join)[1]
 
 
 def drive_jail(policy_path: str, server_path: str, requests, timeout: float = 30.0,
@@ -796,7 +819,7 @@ class TestIdMatching(ProxyCase):
         self.assertEqual(resps[1]["id"], 1)
         self.assertEqual(resps[1]["result"]["client_said"], {"role": "user"})
 
-    def test_upstream_response_passed_through_untouched(self):
+    def test_upstream_response_is_delivered_re_serialised(self):
         srv = self.srv(FAKE_ASKER, "asker.py")
         pol = write_policy(self.tmp, ALLOW_ALL)
         raw = drive_raw(pol, [sys.executable, srv], [
@@ -856,8 +879,7 @@ class TestTransport(ProxyCase):
         pol = write_policy(self.tmp, {"allow_tools": ["*"],
                                       "deny_tools": ["delete_all"],
                                       "arg_rules": {}, "hide_denied": True})
-        env = dict(os.environ)
-        env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+        env = child_env()
         proc = subprocess.Popen(
             [sys.executable, "-m", "mcp_jail", "--policy", pol, "--timeout", "10",
              "--", sys.executable, srv],
@@ -1412,7 +1434,7 @@ class TestDuplicateKeys(ProxyCase):
         with open(log, encoding="utf-8") as f:
             seen = [l.rstrip("\n") for l in f if l.strip()]
         self.assertEqual(len(seen), 1, "a duplicate-key document reached the server")
-        self.assertEqual(seen[0], json.dumps(json.loads(good)))
+        self.assertEqual(seen[0], json.dumps(json.loads(good), separators=(",", ":")))
         self.assertNotEqual(seen[0], good.strip())
 
     def test_duplicate_keys_from_the_server_fail_the_request_closed(self):
@@ -1669,14 +1691,15 @@ class TestServerCommand(ProxyCase):
 
 class TestShutdown(ProxyCase):
     """J-9: the server exiting while the client still holds our stdin open
-    used to abort the proxy with a fatal `_enter_buffered_busy` (rc -6)."""
+    used to abort the proxy with a fatal `_enter_buffered_busy` (rc -6). It
+    still ends the session without a crash - and, since R5-7, with the exit
+    code that says the server failed."""
 
-    def test_server_exit_with_client_stdin_open_is_clean(self):
+    def test_server_exit_with_client_stdin_open_exits_3_without_a_crash(self):
         pol = write_policy(self.tmp, ALLOW_ALL)
         quit_srv = write_server(self.tmp, "import sys\nsys.stdin.readline()\n",
                                 "quit.py")
-        env = dict(os.environ)
-        env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+        env = child_env()
         proc = subprocess.Popen(
             [sys.executable, "-m", "mcp_jail", "--policy", pol, "--",
              sys.executable, quit_srv],
@@ -1702,9 +1725,10 @@ class TestShutdown(ProxyCase):
             if proc.poll() is None:
                 proc.kill()
                 proc.wait(timeout=5)
-        self.assertEqual(rc, 0, err)
+        self.assertEqual(rc, 3, err)
         self.assertNotIn(b"Fatal Python error", err)
         self.assertNotIn(b"Traceback", err)
+        self.assertIn(b"server exited or closed its output", err)
         resps = [json.loads(l) for l in out.splitlines() if l.strip()]
         self.assertEqual(resps[0]["id"], 1)
         self.assertIn("server closed", resps[0]["error"]["message"])
@@ -1838,25 +1862,15 @@ class TestDocs(unittest.TestCase):
         with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
             return f.read()
 
-    def test_readme_test_count_matches_suite(self):
-        m = re.search(r"# (\d+) tests", self.readme())
-        self.assertIsNotNone(m, "README lacks the '# N tests' note")
-        suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
-        self.assertEqual(int(m.group(1)), suite.countTestCases())
+    def test_readme_has_no_hard_coded_test_count(self):
+        # a number in the README is wrong the next time a test is added
+        self.assertNotRegex(self.readme(), r"\b\d+ tests\b")
 
     def test_license_and_install_docs(self):
         with open(os.path.join(REPO, "LICENSE"), encoding="utf-8") as f:
             lic = f.read()
         self.assertIn("MIT License", lic)
         self.assertIn("Dan Calas", lic)
-        try:
-            import tomllib
-        except ImportError:
-            self.skipTest("tomllib needs Python 3.11+")
-        with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
-            proj = tomllib.load(f)["project"]
-        self.assertEqual(proj["license"], "MIT")
-        self.assertEqual(proj["license-files"], ["LICENSE"])
         readme = self.readme()
         self.assertNotIn("TBD", readme)
         self.assertIn("pip install git+https://github.com/calasdan-sketch/mcp-jail", readme)
@@ -1865,6 +1879,15 @@ class TestDocs(unittest.TestCase):
         for word in ("strict_args", "audit_args", "0600", "duplicate", "re-serialised",
                      "case-insensitive", "`..`"):
             self.assertIn(word, readme, word)
+        # the packaging metadata needs tomllib (3.11+): only this part skips
+        try:
+            import tomllib
+        except ImportError:
+            self.skipTest("tomllib needs Python 3.11+")
+        with open(os.path.join(REPO, "pyproject.toml"), "rb") as f:
+            proj = tomllib.load(f)["project"]
+        self.assertEqual(proj["license"], "MIT")
+        self.assertEqual(proj["license-files"], ["LICENSE"])
 
     def test_help_text_covers_every_flag(self):
         parser = cli_mod.build_parser()
@@ -2623,8 +2646,7 @@ class TestBrokenPipe(unittest.TestCase):
     def test_reader_going_away_end_to_end(self):
         for i in range(200):
             jail_mod.audit({"tool": f"t{i}", "decision": "deny", "reason": "x" * 100})
-        env = dict(os.environ)
-        env["PYTHONPATH"] = REPO + os.pathsep + env.get("PYTHONPATH", "")
+        env = child_env()
         proc = subprocess.Popen(
             [sys.executable, "-m", "mcp_jail", "--audit", "--limit", "200"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
@@ -2637,6 +2659,1732 @@ class TestBrokenPipe(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, err)
         self.assertNotIn(b"Traceback", err)
         self.assertNotIn(b"Exception ignored", err)
+
+
+# --------------------------------------------------------------------------
+# Round 5 panel findings
+# --------------------------------------------------------------------------
+
+
+class TestPolicyKeys(ProxyCase):
+    """R5-1: a mistyped policy key was silently ignored, and a policy that
+    ignores its own `alow_tools` allows every tool. Unknown keys are
+    refused at startup, at every level, with a suggestion."""
+
+    def test_mistyped_top_level_key_is_refused_with_a_suggestion(self):
+        for typo, want in (("alow_tools", "allow_tools"),
+                           ("deny_tool", "deny_tools"),
+                           ("arg_rule", "arg_rules"),
+                           ("strict_arg", "strict_args"),
+                           ("hide_deny", "hide_denied"),
+                           ("policed_method", "policed_methods"),
+                           ("deny_method", "deny_methods"),
+                           ("audit_arg", "audit_args")):
+            with self.assertRaises(ValueError, msg=typo) as cm:
+                jail_mod.compile_policy({typo: ["read_file"]})
+            msg = str(cm.exception)
+            self.assertIn(repr(typo), msg)
+            self.assertIn(f"did you mean {want!r}", msg)
+            for key in jail_mod.POLICY_KEYS:  # the message lists what is allowed
+                self.assertIn(key, msg)
+        # a key nothing resembles: refused, no suggestion
+        with self.assertRaises(ValueError) as cm:
+            jail_mod.compile_policy({"zzzzzz": 1})
+        self.assertNotIn("did you mean", str(cm.exception))
+
+    def test_the_panel_repro_does_not_start_the_server(self):
+        # {"alow_tools": ["read_file"]} made every tool callable
+        marker = os.path.join(self.tmp, "started.txt")
+        srv = self.srv("open(%r, 'w').write('x')\n" % marker, "marker.py")
+        pol = write_policy(self.tmp, {"alow_tools": ["read_file"]})
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = jail_mod.run(pol, [sys.executable, srv],
+                                stdin=io.BytesIO(b""), stdout=io.BytesIO())
+        self.assertEqual(code, 2)
+        self.assertIn("bad policy", err.getvalue())
+        self.assertIn("did you mean 'allow_tools'", err.getvalue())
+        self.assertFalse(os.path.exists(marker),
+                         "the server was started under a refused policy")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(cli_mod.main(
+                ["--policy", pol, "--", sys.executable, srv]), 2)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_unknown_keys_are_refused_at_every_level(self):
+        # arg_rules.<tool> takes only allow / deny: `denied` used to mean
+        # "no deny rules at all"
+        for bad, want in (
+                ({"arg_rules": {"read_file": {"denied": {"path": ["^/etc/"]}}}},
+                 "did you mean 'deny'"),
+                ({"arg_rules": {"read_file": {"allow": {}, "alow": {}}}},
+                 "did you mean 'allow'"),
+                ({"arg_rules": {"read_file": {"deny": ["x"], "extra": 1}}},
+                 "unknown key 'extra'")):
+            with self.assertRaises(ValueError, msg=repr(bad)) as cm:
+                jail_mod.compile_policy(bad)
+            self.assertIn(want, str(cm.exception))
+            self.assertIn("arg_rules.read_file", str(cm.exception))
+        # the typed rules were already strict; they stay so
+        with self.assertRaises(ValueError):
+            jail_mod.compile_policy({"arg_rules": {"t": {"deny": {"a": [
+                {"type": "string", "patern": "x"}]}}}})
+        # and the bypass itself: the typo'd deny used to let /etc/passwd by
+        pol = compiled({"arg_rules": {"read_file": {"deny": {"path": ["^/etc/"]}}}})
+        self.assertFalse(jail_mod.tool_allowed(
+            pol, "read_file", {"path": "/etc/passwd"})[0])
+
+    def test_notes_generated_policies_and_the_starter_policy_still_load(self):
+        jail_mod.compile_policy(jail_mod.default_policy())
+        gen = jail_mod.generate_policy(["a", "b"], [("a", {"x": 1})])
+        self.assertIn("_not_called", gen)
+        jail_mod.compile_policy(gen)
+        jail_mod.compile_policy({"_comment": "anything", "allow_tools": ["a"]})
+        # a policy without allow_tools allows what deny_tools leaves alone
+        pol = compiled({"deny_tools": ["delete_all"]})
+        self.assertTrue(jail_mod.tool_allowed(pol, "read_file", {})[0])
+        self.assertFalse(jail_mod.tool_allowed(pol, "delete_all", {})[0])
+
+    def test_internal_markers_cannot_come_from_a_file(self):
+        # "_compiled": true in a policy FILE must not skip the validation
+        for bad in ({"_compiled": True},
+                    {"_compiled": True, "_rules_by_norm": {}},
+                    {"_rules_by_norm": {}}):
+            p = write_policy(self.tmp, bad)
+            with self.assertRaises(ValueError, msg=repr(bad)) as cm:
+                jail_mod.load_policy(p)
+            self.assertIn("reserved", str(cm.exception))
+            code = jail_mod.run(p, [sys.executable, "-c", "pass"],
+                                stdin=io.BytesIO(b""), stdout=io.BytesIO())
+            self.assertEqual(code, 2)
+        # a forged marker on an in-process dict does not skip it either
+        with self.assertRaises(ValueError):
+            jail_mod.compile_policy({"_compiled": True, "alow_tools": []})
+
+    def test_duplicate_keys_in_a_policy_file_are_refused(self):
+        # the last duplicate used to win silently: the deny list vanished
+        p = os.path.join(self.tmp, "dup.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('{"allow_tools": ["*"], "deny_tools": ["delete_all"], '
+                    '"deny_tools": []}')
+        with self.assertRaises(ValueError) as cm:
+            jail_mod.load_policy(p)
+        self.assertIn("duplicate key 'deny_tools'", str(cm.exception))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = jail_mod.run(p, [sys.executable, "-c", "pass"],
+                                stdin=io.BytesIO(b""), stdout=io.BytesIO())
+        self.assertEqual(code, 2)
+        self.assertIn("duplicate key", err.getvalue())
+
+    def test_tool_name_lists_must_hold_names(self):
+        # a nested list or a number in deny_tools was skipped silently
+        for key in ("allow_tools", "deny_tools"):
+            for bad in ([["delete_all"]], [5], [None], [""],
+                        ["ok", {"name": "x"}]):
+                with self.assertRaises(ValueError, msg=(key, bad)):
+                    jail_mod.compile_policy({key: bad})
+        with self.assertRaises(ValueError):
+            jail_mod.compile_policy({"allow_tools": "*"})
+        with self.assertRaises(ValueError):
+            jail_mod.compile_policy({"hide_denied": "yes"})
+        jail_mod.compile_policy({"allow_tools": ["a", "b"], "deny_tools": [],
+                                 "hide_denied": False})
+
+
+# A server written the way a Java/Jackson one is: its lines come from
+# BufferedReader.readLine(), which ends a line at \n, \r OR \r\n, and its
+# JSON reader ignores whatever follows the first value on a line. Logs the
+# tools it ran to argv[1] ("ran:<name>").
+FAKE_JAVA = r"""
+import json, re, sys
+log = open(sys.argv[1], "a", encoding="utf-8")
+dec = json.JSONDecoder()
+buf = b""
+def handle(line):
+    text = line.decode("utf-8", "replace").strip()
+    if not text:
+        return
+    try:
+        req, _ = dec.raw_decode(text)        # trailing tokens are ignored
+    except ValueError:
+        return
+    if not isinstance(req, dict):
+        return
+    if req.get("method") == "tools/call":
+        log.write("ran:" + str(req["params"]["name"]) + "\n"); log.flush()
+    rid = req.get("id")
+    if rid is None:
+        return
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"ok": True}}) + "\n")
+    sys.stdout.flush()
+inp = sys.stdin.buffer
+while True:
+    chunk = inp.read1(65536)
+    if not chunk:
+        break
+    buf += chunk
+    parts = re.split(rb"\r\n|\r|\n", buf)
+    buf = parts.pop()
+    for p in parts:
+        handle(p)
+"""
+
+# A server written the way a Go one is: encoding/json matches keys to struct
+# fields case-insensitively (Unicode simple folding: U+017F reads as "s"), and
+# when several keys match the same field the last one wins. Logs the tools it
+# ran to argv[1] ("ran:<name>").
+FAKE_GO = r"""
+import json, sys
+log = open(sys.argv[1], "a", encoding="utf-8")
+def field(obj, name):
+    val = None
+    for k, v in obj.items():
+        if k.casefold() == name:
+            val = v
+    return val
+for raw in iter(sys.stdin.buffer.readline, b""):
+    line = raw.decode("utf-8").strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    method, rid = field(req, "method"), field(req, "id")
+    if method == "tools/call":
+        params = field(req, "params") or {}
+        log.write("ran:" + str(field(params, "name")) + "\n")
+        log.write("args:" + json.dumps(field(params, "arguments")) + "\n"); log.flush()
+    if rid is None:
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"ok": True}}) + "\n")
+    sys.stdout.flush()
+"""
+
+# A server that routes on the method name without regard to case, the way a
+# lowercasing router does (and reads the other fields exactly). Logs
+# "ran:<name>" for what it takes to be a tools/call.
+FAKE_LOOSE_METHOD = r"""
+import json, sys
+log = open(sys.argv[1], "a", encoding="utf-8")
+for raw in iter(sys.stdin.buffer.readline, b""):
+    line = raw.decode("utf-8").strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    rid = req.get("id")
+    if str(req.get("method")).casefold() == "tools/call":
+        log.write("ran:" + str((req.get("params") or {}).get("name")) + "\n"); log.flush()
+    if rid is None:
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"ok": True}}) + "\n")
+    sys.stdout.flush()
+"""
+
+# Waits for the first request, then writes the bytes in the file named by
+# argv[1] to stdout exactly as they are (to put hostile framing on the wire).
+FAKE_EMIT = r"""
+import sys
+data = open(sys.argv[1], "rb").read()
+sys.stdin.buffer.readline()
+sys.stdout.buffer.write(data); sys.stdout.buffer.flush()
+for _ in iter(sys.stdin.buffer.readline, b""):
+    pass
+"""
+
+
+def ran_tools(path: str) -> list:
+    """What a FAKE_JAVA / FAKE_GO server logged as executed."""
+    if not os.path.exists(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [l.strip()[4:] for l in f if l.startswith("ran:")]
+
+
+def audit_records() -> list:
+    if not os.path.exists(jail_mod.AUDIT_LOG):
+        return []
+    with open(jail_mod.AUDIT_LOG, encoding="utf-8") as f:
+        return [json.loads(l) for l in f if l.strip()]
+
+
+DENY_DELETE = {"allow_tools": ["*"], "deny_tools": ["delete_all"],
+               "arg_rules": {}, "hide_denied": False}
+
+
+class TestLineSmuggling(ProxyCase):
+    """R5-4: a message the policy let through was forwarded byte for byte,
+    bare CR and all. A server that ends lines on CR (Java's readLine,
+    Python's universal newlines) split it into two messages and ran the
+    second - a tools/call nobody had checked or logged."""
+
+    CARRIER = ('{"jsonrpc":"2.0","id":1,"method":"ping","x":\r'
+               '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":'
+               '{"name":"delete_all","arguments":{}}}}')
+
+    def attack(self, requests, patch_control: bool = False):
+        log = os.path.join(self.tmp, "ran.txt")
+        srv = self.srv(FAKE_JAVA, "java.py")
+        pol = write_policy(self.tmp, DENY_DELETE)
+        if patch_control:
+            # switch the raw-control-character refusal off: the forwarded
+            # bytes alone must keep the second message from existing
+            with mock.patch.object(jail_mod, "_CONTROL", re.compile(r"(?!)")):
+                resps = drive_jail(pol, srv, requests, timeout=3,
+                                   server_args=[log])
+        else:
+            resps = drive_jail(pol, srv, requests, timeout=3, server_args=[log])
+        return resps, ran_tools(log)
+
+    def test_the_panel_repro_is_blocked_and_logged(self):
+        resps, ran = self.attack([self.CARRIER, {"jsonrpc": "2.0", "id": 3,
+                                                 "method": "ping"}])
+        self.assertEqual(ran, [], "the smuggled delete_all reached the server")
+        by_id = {r["id"]: r for r in resps}
+        # the carrier is refused, under its own id, and says why
+        self.assertEqual(by_id[1]["error"]["code"], -32600)
+        self.assertIn("control character", by_id[1]["error"]["message"])
+        self.assertIn("result", by_id[3])        # the session carries on
+        records = [r for r in audit_records() if r.get("rejected")]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["rejected"], "client")
+        self.assertEqual(records[0]["decision"], "deny")
+        self.assertIn("control character", records[0]["reason"])
+
+    def test_a_notification_carrier_is_blocked_too(self):
+        carrier = self.CARRIER.replace('"id":1,"method":"ping"',
+                                       '"method":"notifications/x"')
+        resps, ran = self.attack([carrier, {"jsonrpc": "2.0", "id": 3,
+                                            "method": "ping"}])
+        self.assertEqual(ran, [])
+        self.assertEqual([r.get("id") for r in resps], [None, 3])
+        self.assertEqual(resps[0]["error"]["code"], -32600)
+        self.assertEqual(len([r for r in audit_records() if r.get("rejected")]), 1)
+
+    def test_forwarded_bytes_alone_defeat_the_split(self):
+        # even with the refusal switched off the server sees ONE message:
+        # what is forwarded is the re-serialised object, not the client's CR
+        resps, ran = self.attack([self.CARRIER, {"jsonrpc": "2.0", "id": 3,
+                                                 "method": "ping"}],
+                                 patch_control=True)
+        self.assertEqual(ran, [], "the re-serialised line still split")
+        self.assertEqual({r["id"] for r in resps}, {1, 3})
+        self.assertTrue(all("result" in r for r in resps))
+
+    def test_through_the_real_entry_point(self):
+        # a real stdin pipe (raw fd reads), the real __main__
+        log = os.path.join(self.tmp, "ran.txt")
+        srv = self.srv(FAKE_JAVA, "java.py")
+        pol = write_policy(self.tmp, DENY_DELETE)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--timeout", "3",
+             "--", sys.executable, srv, log],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, env=child_env(), cwd=self.tmp)
+        try:
+            out, err = proc.communicate(
+                (self.CARRIER + "\n" + json.dumps(
+                    {"jsonrpc": "2.0", "id": 3, "method": "ping"}) + "\n"
+                 ).encode("utf-8"), timeout=60)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+        self.assertEqual(ran_tools(log), [])
+        msgs = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual({m["id"] for m in msgs}, {1, 3}, err)
+
+    def test_other_raw_control_characters_are_refused(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_RECORDER, "rec.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        resps = drive_jail(pol, srv, [
+            '{"jsonrpc":"2.0",\t"id":5,"method":"ping"}',          # TAB
+            '{"jsonrpc":"2.0","id":6,"method":"ping"\x0b}',        # VT
+            '{"jsonrpc":"2.0","id":7,"method":"ping"}\x0c',        # FF
+            {"jsonrpc": "2.0", "id": 8, "method": "ping",
+             "params": {"flush": True}}],
+            timeout=5, server_args=[log])
+        by_id = {r["id"]: r for r in resps}
+        # TAB parses (it is JSON whitespace) and is refused under its own id;
+        # VT / FF are not JSON whitespace at all: a parse error
+        self.assertEqual(by_id[5]["error"]["code"], -32600)
+        self.assertIn("U+0009", by_id[5]["error"]["message"])
+        self.assertEqual([r["error"]["code"] for r in resps if r["id"] is None],
+                         [-32700, -32700])
+        self.assertIn("result", by_id[8])
+        with open(log, encoding="utf-8") as f:
+            seen = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual([m["id"] for m in seen], [8])
+
+    def test_parse_refuses_control_characters_but_not_text(self):
+        obj, code, err = jail_mod._parse(b'{"a":\r1}\n')
+        self.assertIsNone(obj)
+        self.assertEqual(code, jail_mod.INVALID_REQUEST)
+        self.assertIn("control character U+000D", err)
+        # U+2028 / U+0085 / DEL are text, legitimate inside a string (a
+        # Word document pasted into a tool argument): accepted, and they
+        # leave as escapes (see TestCanonicalWire)
+        raw = '{"a":"x\u2028y\u0085z\x7f"}\n'.encode("utf-8")
+        obj, code, _ = jail_mod._parse(raw)
+        self.assertIsNone(code)
+        self.assertEqual(obj, {"a": "x\u2028y\u0085z\x7f"})
+        self.assertEqual(jail_mod._parse(b"   \n"), (None, None, ""))
+
+
+class TestCanonicalWire(ProxyCase):
+    """R5-4: both directions carry the re-serialised object - compact JSON,
+    pure ASCII, finite numbers - never the peer's bytes, so the jail and
+    whatever sits behind it cannot parse a line differently."""
+
+    def test_server_receives_compact_ascii_json(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_RECORDER, "rec.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        resps = drive_jail(pol, srv, [
+            '  { "jsonrpc" : "2.0", "id": 7 , "method": "ping",  '
+            '"params": {"s": "é日 \u2028 \\u2028", "n": 1E2, "big": '
+            '123456789012345678901234567890, "f": 0.5, "z": [ ] } }  ',
+            {"jsonrpc": "2.0", "id": 8, "method": "ping", "params": {"flush": True}}],
+            timeout=5, server_args=[log])
+        self.assertEqual(len(resps), 2)
+        with open(log, encoding="utf-8") as f:
+            seen = [l.rstrip("\n") for l in f if l.strip()]
+        self.assertEqual(seen[0],
+                         '{"jsonrpc":"2.0","id":7,"method":"ping","params":'
+                         '{"s":"\\u00e9\\u65e5 \\u2028 \\u2028","n":100.0,'
+                         '"big":123456789012345678901234567890,"f":0.5,"z":[]}}')
+        self.assertTrue(seen[0].isascii())
+
+    def test_server_responses_are_delivered_re_serialised(self):
+        emit = os.path.join(self.tmp, "emit.bin")
+        with open(emit, "wb") as f:
+            f.write('{ "jsonrpc": "2.0", "id": 1,'.encode("utf-8")
+                    + ' "result": {"t": "é\u2028", "n": 1E2} }\r\n'.encode("utf-8"))
+        srv = self.srv(FAKE_EMIT, "emit.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        raw = drive_raw(pol, [sys.executable, srv, emit],
+                        [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], timeout=5)
+        self.assertEqual(raw, [b'{"jsonrpc":"2.0","id":1,"result":'
+                               b'{"t":"\\u00e9\\u2028","n":100.0}}'])
+
+    def test_a_server_line_cannot_smuggle_a_second_message_to_the_client(self):
+        # the mirror image: a server puts a bare CR in a notification and the
+        # client's reader (readLine, universal newlines) splits it in two
+        emit = os.path.join(self.tmp, "emit.bin")
+        forged = (b'{"jsonrpc":"2.0","method":"notifications/message","params":'
+                  b'{"x":\r{"jsonrpc":"2.0","id":99,"result":{"forged":true}}}}\n'
+                  b'{"jsonrpc":"2.0","id":1,"result":{"real":true}}\n')
+        with open(emit, "wb") as f:
+            f.write(forged)
+        srv = self.srv(FAKE_EMIT, "emit.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        raw = drive_raw(pol, [sys.executable, srv, emit],
+                        [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], timeout=5)
+        wire = b"\n".join(raw)
+        parts = [p for p in re.split(rb"\r\n|\r|\n", wire) if p.strip()]
+        self.assertFalse(any(b"forged" in p for p in parts), parts)
+        self.assertEqual([json.loads(p)["id"] for p in parts], [1])  # the real answer
+        records = [r for r in audit_records() if r.get("rejected") == "server"]
+        self.assertEqual(len(records), 1)
+        self.assertIn("control character", records[0]["reason"])
+
+    def test_a_response_with_a_control_character_fails_its_request_closed(self):
+        emit = os.path.join(self.tmp, "emit.bin")
+        with open(emit, "wb") as f:
+            f.write(b'{"jsonrpc":"2.0",\t"id":1,"result":{"ok":true}}\n')
+        srv = self.srv(FAKE_EMIT, "emit.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        resps = [json.loads(l) for l in drive_raw(
+            pol, [sys.executable, srv, emit],
+            [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], timeout=5)]
+        self.assertEqual(len(resps), 1)
+        self.assertEqual(resps[0]["id"], 1)
+        self.assertEqual(resps[0]["error"]["code"], -32603)
+        self.assertIn("bad response from server", resps[0]["error"]["message"])
+        self.assertIn("control character", resps[0]["error"]["message"])
+
+    def test_numbers_that_json_cannot_carry_are_refused_both_ways(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        resps = drive_jail(pol, self.server, [
+            '{"jsonrpc":"2.0","id":1,"method":"ping","params":{"n":1e999}}',
+            '{"jsonrpc":"2.0","id":2,"method":"ping","params":{"n":-1e999}}',
+            '{"jsonrpc":"2.0","id":3,"method":"ping","params":{"n":NaN}}',
+            {"jsonrpc": "2.0", "id": 4, "method": "ping"}])
+        # 1e999 is well-formed JSON the jail will not carry: refused under
+        # its own id; NaN is not JSON at all
+        self.assertEqual([(r["id"], r["error"]["code"]) for r in resps[:3]],
+                         [(1, -32600), (2, -32600), (3, -32700)])
+        self.assertIn("number out of range", resps[0]["error"]["message"])
+        self.assertIn("result", resps[3])
+        emit = os.path.join(self.tmp, "emit.bin")
+        with open(emit, "wb") as f:
+            f.write(b'{"jsonrpc":"2.0","id":1,"result":{"n":1e999}}\n')
+        srv = self.srv(FAKE_EMIT, "emit.py")
+        # a 30 s timeout and a 20 s join: only an answer by id, not the
+        # timeout, lets this finish
+        out = [json.loads(l) for l in drive_raw(
+            pol, [sys.executable, srv, emit],
+            [{"jsonrpc": "2.0", "id": 1, "method": "ping"}], timeout=30)]
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["error"]["code"], -32603)
+        self.assertIn("number out of range", out[0]["error"]["message"])
+
+    def test_messages_that_are_not_requests_or_responses_are_refused(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_RECORDER, "rec.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        resps = drive_jail(pol, srv, [
+            {"jsonrpc": "2.0", "id": 1},                           # nothing
+            {"jsonrpc": "2.0", "id": 2, "result": 1, "error": {}},  # both
+            {"jsonrpc": "2.0", "id": 3, "method": "ping", "result": {}},
+            {"jsonrpc": "2.0", "result": {}},                      # no id
+            {"jsonrpc": "2.0", "id": 4, "method": "ping",
+             "params": {"flush": True}}], timeout=5, server_args=[log])
+        errors = {r["id"]: r["error"]["code"] for r in resps if "error" in r}
+        self.assertEqual(errors[1], -32600)
+        self.assertEqual(errors[2], -32600)
+        self.assertEqual(errors[3], -32600)
+        self.assertEqual(errors[None], -32600)
+        self.assertIn(4, [r["id"] for r in resps if "result" in r])
+        with open(log, encoding="utf-8") as f:
+            seen = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual([m["id"] for m in seen], [4])
+
+
+def go_view(line: bytes) -> dict:
+    """One line from the jail as a client with a Go-style JSON reader sees it:
+    keys matched without regard to case, the last duplicate winning."""
+    view = {}
+    for key, value in json.loads(line).items():
+        view[key.casefold()] = value
+    return view
+
+
+class TestProtocolKeySpelling(ProxyCase):
+    """R5-2: the jail looked for the exact lowercase `method` / `params`; a
+    message spelled METHOD / PARAMS was forwarded as something that is not a
+    request - and a server that matches JSON keys without regard to case (Go's
+    encoding/json, C#'s System.Text.Json when told to, Jackson when told to)
+    ran it as a tools/call nobody had checked. A key that reads as an envelope
+    key in another spelling is refused, not normalised."""
+
+    PANEL = '{"METHOD":"tools/call","PARAMS":{"name":"delete_all","arguments":{}}}'
+    DEL = {"name": "delete_all", "arguments": {}}
+    OK = {"name": "read_file", "arguments": {}}
+
+    # (the key that must be named, the attack, the error code the client gets)
+    ATTACKS = [
+        ("METHOD", PANEL, -32600),             # the panel's repro, verbatim
+        ("METHOD", {"jsonrpc": "2.0", "id": 2, "result": {},   # dressed as a client response
+                    "METHOD": "tools/call", "PARAMS": DEL}, -32600),
+        ("METHOD", {"jsonrpc": "2.0", "id": 3, "method": "ping",  # last duplicate wins
+                    "METHOD": "tools/call", "params": DEL}, -32600),
+        ("PARAMS", {"jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": OK, "PARAMS": DEL}, -32600),
+        ("NAME", {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+                  "params": {"name": "read_file", "NAME": "delete_all",
+                             "arguments": {}}}, -32602),
+        ("param\\u017f", {"jsonrpc": "2.0", "id": 6, "method": "tools/call",   # U+017F reads as "s"
+                         "params": OK, "param\u017f": DEL}, -32600),
+        ("Id", {"jsonrpc": "2.0", "id": 7, "Id": 8, "method": "tools/call",
+                "params": OK}, -32600),
+        ("RESULT", {"jsonrpc": "2.0", "id": 9, "result": {}, "RESULT": {}}, -32600),
+    ]
+
+    def go(self, requests, pol=None, timeout=3, tag="x"):
+        log = os.path.join(self.tmp, "ran-%s.txt" % tag)
+        srv = self.srv(FAKE_GO, "go.py")
+        path = write_policy(self.tmp, pol or DENY_DELETE)
+        resps = drive_jail(path, srv, requests, timeout=timeout, server_args=[log])
+        return resps, ran_tools(log)
+
+    def test_every_spelling_variant_is_refused_before_the_server_sees_it(self):
+        for n, (key, msg, code) in enumerate(self.ATTACKS):
+            with self.subTest(key=key, n=n):
+                resps, ran = self.go([msg, {"jsonrpc": "2.0", "id": 90, "method": "ping"}],
+                                     tag="a%d" % n)
+                self.assertEqual(ran, [], "the server ran the smuggled tools/call")
+                answers = [r for r in resps if r.get("id") != 90]
+                self.assertEqual(len(answers), 1, resps)
+                self.assertEqual(answers[0]["error"]["code"], code)
+                self.assertIn(key, answers[0]["error"]["message"])
+                self.assertIn("result", [r for r in resps if r.get("id") == 90][0])
+        # one audit record each, every one a deny that names the key
+        records = audit_records()
+        self.assertEqual(len(records), len(self.ATTACKS))
+        for rec, (key, _msg, _code) in zip(records, self.ATTACKS):
+            self.assertEqual(rec["decision"], "deny")
+            self.assertIn(key, rec["reason"])
+
+    def test_the_panel_repro_no_id_is_dropped_with_a_record(self):
+        resps, ran = self.go([self.PANEL, {"jsonrpc": "2.0", "id": 2, "method": "ping"}])
+        self.assertEqual(ran, [])
+        self.assertEqual(len(audit_records()), 1)
+        self.assertEqual(audit_records()[0]["rejected"], "client")
+        self.assertIn("METHOD", audit_records()[0]["reason"])
+
+    def test_arguments_in_another_case_cannot_dodge_the_argument_rules(self):
+        pol = {"allow_tools": ["*"], "deny_tools": [], "hide_denied": False,
+               "arg_rules": {"read_file": {"deny": {"**.path": ["^/etc/"]}}}}
+        resps, ran = self.go([
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "read_file", "arguments": {"path": "/tmp/ok"},
+                        "ARGUMENTS": {"path": "/etc/passwd"}}},
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+             "params": {"name": "read_file", "arguments": {"path": "/tmp/ok"}}}],
+            pol=pol)
+        self.assertEqual(ran, ["read_file"], "only the clean call may run")
+        by_id = {r["id"]: r for r in resps}
+        self.assertEqual(by_id[1]["error"]["code"], -32602)
+        self.assertIn("ARGUMENTS", by_id[1]["error"]["message"])
+        self.assertIn("result", by_id[2])
+
+    def test_a_server_that_matches_keys_loosely_still_cannot_be_reached(self):
+        # the control: this is what the unguarded message does to such a server
+        log = os.path.join(self.tmp, "direct.txt")
+        srv = self.srv(FAKE_GO, "go.py")
+        proc = subprocess.run([sys.executable, srv, log],
+                              input=(self.PANEL + "\n").encode("utf-8"),
+                              stdout=subprocess.PIPE, timeout=30, env=child_env())
+        self.assertEqual(ran_tools(log), ["delete_all"], proc.stdout)
+
+    def test_method_value_spellings_are_judged_as_the_method(self):
+        log = os.path.join(self.tmp, "ran.txt")
+        srv = self.srv(FAKE_LOOSE_METHOD, "loose.py")
+        pol = write_policy(self.tmp, DENY_DELETE)
+        variants = ["Tools/Call", "TOOLS/CALL", "tool\u017f/call", "tools/call\u200b"]
+        resps = drive_jail(pol, srv, [
+            {"jsonrpc": "2.0", "id": n, "method": m, "params": self.DEL}
+            for n, m in enumerate(variants, 1)], timeout=3, server_args=[log])
+        self.assertEqual(ran_tools(log), [])
+        self.assertEqual([r["error"]["code"] for r in sorted(resps, key=lambda r: r["id"])],
+                         [-32602] * len(variants))
+        self.assertTrue(all("denied" in r["error"]["message"] for r in resps))
+
+    def test_deny_methods_and_policed_methods_see_through_the_spelling(self):
+        pol = {"deny_methods": ["resources/*", "prompts/get"],
+               "policed_methods": ["tools/call", "sampling/createMessage"],
+               "deny_tools": ["secret"]}
+        jail_mod.compile_policy(pol)
+        for m in ("resources/list", "RESOURCES/LIST", "Resources/Read",
+                  "resource\u017f/read", "Prompts/Get", "prompts/get\u200b"):
+            self.assertTrue(jail_mod.method_denied(pol, m), m)
+        for m in ("prompts/list", "resource/read", "xresources/read"):
+            self.assertFalse(jail_mod.method_denied(pol, m), m)
+        for m in ("tools/call", "Tools/Call", "TOOLS/CALL", "tool\u017f/call",
+                  "tools/call\u200b", "Sampling/CreateMessage"):
+            self.assertTrue(jail_mod.method_policed(pol, m), m)
+        for m in ("tools/list", "tools/calls", "sampling/create"):
+            self.assertFalse(jail_mod.method_policed(pol, m), m)
+        # a pattern is folded too: "Resources/*" in a policy denies resources/*
+        up = {"deny_methods": ["Resources/*"]}
+        self.assertTrue(jail_mod.method_denied(up, "resources/list"))
+
+    def test_deny_methods_end_to_end(self):
+        pol = write_policy(self.tmp, {"allow_tools": ["*"], "deny_tools": [],
+                                      "hide_denied": False,
+                                      "deny_methods": ["resources/*"]})
+        resps = drive_jail(pol, self.server, [
+            {"jsonrpc": "2.0", "id": 1, "method": "RESOURCES/READ", "params": {"uri": "x"}},
+            {"jsonrpc": "2.0", "id": 2, "method": "Resources/List"},
+            {"jsonrpc": "2.0", "id": 3, "method": "ping"}])
+        by_id = {r["id"]: r for r in resps}
+        self.assertEqual(by_id[1]["error"]["code"], -32601)
+        self.assertEqual(by_id[2]["error"]["code"], -32601)
+        self.assertIn("result", by_id[3])
+
+    def test_key_clash_helper(self):
+        clash, keys = jail_mod._key_clash, jail_mod._ENVELOPE_KEYS
+        self.assertIsNone(clash({"jsonrpc": "2.0", "id": 1, "method": "x",
+                                 "params": {}, "result": 1, "error": 2}, keys))
+        for bad in ("METHOD", "Method", "mEtHoD", "param\u017f", "PARAM\u017f",
+                    "\uff4d\uff45\uff54\uff48\uff4f\uff44", "method\u200b", " method",
+                    "Id", "ID", "Result", "ERROR", "JSONRPC"):
+            self.assertEqual(clash({"id": 1, bad: 1}, keys), bad, ascii(bad))
+        # not a spelling of an envelope key: left alone
+        for fine in ("foo", "_meta", "methods", "m\u0435thod", "method_"):
+            self.assertIsNone(clash({fine: 1}, keys), ascii(fine))
+
+
+class TestServerKeySpelling(ProxyCase):
+    """R5-2, server -> client: the jail filters `result.tools`; a client that
+    reads keys without regard to case reads the last spelling, which the
+    filter never saw."""
+
+    POL = {"allow_tools": ["*"], "deny_tools": ["delete_all"], "arg_rules": {},
+           "hide_denied": True}
+
+    def emit(self, line: bytes, request=None):
+        path = os.path.join(self.tmp, "emit.bin")
+        with open(path, "wb") as f:
+            f.write(line)
+        srv = self.srv(FAKE_EMIT, "emit.py")
+        pol = write_policy(self.tmp, self.POL)
+        raw = drive_raw(pol, [sys.executable, srv, path],
+                        [request or {"jsonrpc": "2.0", "id": 1, "method": "tools/list"}],
+                        timeout=30)
+        return [go_view(l) for l in raw]
+
+    @staticmethod
+    def names(views):
+        return [t.get("name") for v in views
+                for t in (v.get("result") or {}).get("tools", [])]
+
+    def test_a_second_spelling_of_result_fails_the_request_closed(self):
+        views = self.emit(b'{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_file"}]},'
+                          b'"RESULT":{"tools":[{"name":"delete_all"}]}}\n')
+        self.assertNotIn("delete_all", self.names(views))
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0]["error"]["code"], -32603)
+        self.assertIn("RESULT", views[0]["error"]["message"])
+        self.assertEqual(audit_records()[-1]["rejected"], "server")
+
+    def test_a_second_spelling_of_tools_fails_the_request_closed(self):
+        views = self.emit(b'{"jsonrpc":"2.0","id":1,"result":{"tools":[{"name":"read_file"}],'
+                          b'"TOOLS":[{"name":"delete_all"}]}}\n')
+        self.assertNotIn("delete_all", self.names(views))
+        self.assertEqual(views[0]["error"]["code"], -32603)
+
+    def test_a_tool_entry_with_a_second_spelling_of_name_is_hidden(self):
+        views = self.emit(b'{"jsonrpc":"2.0","id":1,"result":{"tools":['
+                          b'{"name":"read_file","NAME":"delete_all"},{"name":"ok"}]}}\n')
+        self.assertEqual(self.names(views), ["ok"])
+        pol = {"deny_tools": ["delete_all"]}
+        res = {"tools": [{"name": "ok", "Name": "delete_all"}, {"name": "fine"}]}
+        jail_mod.filter_tools_list(pol, res)
+        self.assertEqual(res["tools"], [{"name": "fine"}])
+
+    def test_server_messages_with_envelope_key_clashes_are_refused(self):
+        views = self.emit(b'{"jsonrpc":"2.0","method":"notifications/message",'
+                          b'"PARAMS":{"x":1}}\n'
+                          b'{"jsonrpc":"2.0","id":1,"result":{}}\n')
+        self.assertEqual([v["id"] for v in views], [1])
+        self.assertEqual(audit_records()[-1]["rejected"], "server")
+        self.assertIn("PARAMS", audit_records()[-1]["reason"])
+
+
+def rpc_msg(req_id, method, params=None):
+    msg = {"jsonrpc": "2.0", "id": req_id, "method": method}
+    if params is not None:
+        msg["params"] = params
+    return msg
+
+
+class TestSelectors(ProxyCase):
+    """R5-3: resources/read was judged by params.name, with params.uri only a
+    fallback - so {"uri": "file:///etc/passwd", "name": "harmless"} walked past
+    a deny on the uri (and past an allowlist: name=<allowed>, uri=<anything>).
+    Each policed method is judged by the field that really selects what the
+    call touches, and a second selector beside it is refused, not preferred."""
+
+    SECRET_URI = "file:///etc/passwd"
+
+    def verdicts(self, policy, *calls):
+        """{request id: "allow" or the error message the client got}"""
+        pol = write_policy(self.tmp, dict(ALLOW_ALL, **policy))
+        resps = drive_jail(pol, self.server, [rpc_msg(i, m, p)
+                                              for i, (m, p) in enumerate(calls, 1)])
+        return {r["id"]: ("allow" if "result" in r else r["error"]["message"])
+                for r in resps}
+
+    def assertDenied(self, verdict, *words):
+        self.assertNotEqual(verdict, "allow")
+        self.assertIn("mcp-jail denied", verdict)
+        for w in words:
+            self.assertIn(w, verdict)
+
+    def test_resources_read_is_judged_by_uri_whatever_name_says(self):
+        v = self.verdicts(
+            {"deny_tools": [self.SECRET_URI], "policed_methods": ["resources/read"]},
+            ("resources/read", {"uri": self.SECRET_URI, "name": "harmless"}),  # the panel's repro
+            ("resources/read", {"uri": self.SECRET_URI}),
+            ("resources/read", {"name": self.SECRET_URI}),     # name selects nothing here
+            ("resources/read", {"uri": "file:///srv/ok.txt"}))
+        self.assertDenied(v[1], "'uri'", "'name'")
+        self.assertDenied(v[2], "denied by policy")
+        self.assertDenied(v[3], "uri")
+        self.assertEqual(v[4], "allow")
+
+    def test_an_allowlist_is_not_satisfied_through_name(self):
+        v = self.verdicts(
+            {"allow_tools": ["file:///srv/ok.txt"], "policed_methods": ["resources/read"]},
+            # judged by `name` (allowed), served by `uri` (anything)
+            ("resources/read", {"uri": self.SECRET_URI, "name": "file:///srv/ok.txt"}),
+            ("resources/read", {"uri": "file:///srv/ok.txt"}),
+            ("resources/read", {"uri": self.SECRET_URI}))
+        self.assertDenied(v[1])
+        self.assertEqual(v[2], "allow")
+        self.assertDenied(v[3], "not in allow_tools")
+
+    def test_subscribe_and_unsubscribe_are_judged_by_uri_too(self):
+        for method in ("resources/subscribe", "resources/unsubscribe"):
+            with self.subTest(method=method):
+                v = self.verdicts(
+                    {"deny_tools": [self.SECRET_URI], "policed_methods": [method]},
+                    (method, {"uri": self.SECRET_URI, "name": "harmless"}),
+                    (method, {"uri": self.SECRET_URI}),
+                    (method, {"uri": "file:///srv/ok.txt"}))
+                self.assertDenied(v[1])
+                self.assertDenied(v[2], "denied by policy")
+                self.assertEqual(v[3], "allow")
+
+    def test_prompts_get_and_tools_call_are_judged_by_name(self):
+        v = self.verdicts(
+            {"deny_tools": ["secret_prompt"], "policed_methods": ["prompts/get"]},
+            ("prompts/get", {"name": "secret_prompt"}),
+            ("prompts/get", {"name": "ok"}),
+            ("prompts/get", {"name": "ok", "uri": "secret_prompt"}),   # a second selector
+            ("prompts/get", {"uri": "secret_prompt"}),                 # no name
+            ("tools/call", {"name": "read_file", "uri": "delete_all"}))
+        self.assertDenied(v[1], "denied by policy")
+        self.assertEqual(v[2], "allow")
+        self.assertDenied(v[3], "'name'", "'uri'")
+        self.assertDenied(v[4], "name")
+        self.assertDenied(v[5], "'name'", "'uri'")
+
+    def test_completion_complete_is_judged_by_its_ref(self):
+        pol = {"deny_tools": ["secret_prompt", self.SECRET_URI],
+               "policed_methods": ["completion/complete"]}
+        arg = {"name": "x", "value": "y"}        # the argument being completed: no selector
+        v = self.verdicts(
+            pol,
+            ("completion/complete", {"ref": {"type": "ref/prompt", "name": "secret_prompt"}, "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/prompt", "name": "ok"}, "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/resource", "uri": self.SECRET_URI}, "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/resource", "uri": "file:///srv/ok"}, "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/other", "name": "ok"}, "argument": arg}),
+            ("completion/complete", {"argument": arg}),                       # no ref
+            ("completion/complete", {"ref": "secret_prompt", "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/prompt", "name": "ok",
+                                             "uri": self.SECRET_URI}, "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/resource", "uri": "file:///srv/ok",
+                                             "name": "secret_prompt"}, "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/prompt", "name": "ok"},
+                                     "name": "secret_prompt", "argument": arg}),
+            ("completion/complete", {"ref": {"type": "ref/prompt", "name": "ok",
+                                             "NAME": "secret_prompt"}, "argument": arg}))
+        self.assertDenied(v[1], "denied by policy")
+        self.assertEqual(v[2], "allow")
+        self.assertDenied(v[3], "denied by policy")
+        self.assertEqual(v[4], "allow")
+        self.assertDenied(v[5], "ref/other")
+        self.assertDenied(v[6], "ref")
+        self.assertDenied(v[7], "object")
+        self.assertDenied(v[8], "'uri'")
+        self.assertDenied(v[9], "'name'")
+        self.assertDenied(v[10], "'name'")
+        self.assertDenied(v[11], "NAME")
+
+    def test_a_method_added_through_policed_methods_needs_exactly_one_selector(self):
+        v = self.verdicts(
+            {"deny_tools": ["secret"], "policed_methods": ["acme/fetch"]},
+            ("acme/fetch", {"name": "secret"}),
+            ("acme/fetch", {"uri": "secret"}),
+            ("acme/fetch", {"name": "ok"}),
+            ("acme/fetch", {"uri": "ok"}),
+            ("acme/fetch", {"name": "ok", "uri": "secret"}),
+            ("acme/fetch", {}))
+        self.assertDenied(v[1], "denied by policy")
+        self.assertDenied(v[2], "denied by policy")
+        self.assertEqual(v[3], "allow")
+        self.assertEqual(v[4], "allow")
+        self.assertDenied(v[5], "exactly one")
+        self.assertDenied(v[6], "exactly one")
+
+    def test_audit_records_name_the_method_and_the_selector(self):
+        self.verdicts(
+            {"deny_tools": [self.SECRET_URI], "policed_methods": ["resources/read"]},
+            ("resources/read", {"uri": self.SECRET_URI}),
+            ("resources/read", {"uri": "file:///a", "name": "b"}))
+        first, second = audit_records()
+        self.assertEqual((first["method"], first["tool"], first["decision"]),
+                         ("resources/read", self.SECRET_URI, "deny"))
+        self.assertEqual((second["method"], second["decision"]), ("resources/read", "deny"))
+        self.assertNotIn("tool", second)        # nothing could be said to select
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli_mod.cmd_audit(argparse.Namespace(limit=50))
+        self.assertIn("DENY  " + self.SECRET_URI, buf.getvalue())
+        self.assertIn("DENY  method resources/read", buf.getvalue())
+
+    def test_readme_says_what_each_method_is_judged_by(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        for method in ("resources/read", "resources/subscribe", "resources/unsubscribe",
+                       "prompts/get", "completion/complete", "ref/prompt", "ref/resource"):
+            self.assertIn(method, readme)
+
+
+# A server that never reads its stdin (stuck in a loop, deadlocked, busy for
+# good): the pipe to it fills up. Writes its pid to argv[1].
+FAKE_DEAF = r"""
+import os, sys, time
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(60)
+"""
+
+# Does not read for the first 1.5 s, then reads everything and answers.
+FAKE_LATE_READER = r"""
+import json, sys, time
+time.sleep(1.5)
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    req = json.loads(line)
+    if req.get("id") is None:
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"], "result": {"ok": True}}) + "\n")
+    sys.stdout.flush()
+"""
+
+# The same, and it ignores SIGTERM (but notes that it was sent one).
+FAKE_DEAF_PROUD = r"""
+import os, signal, sys, time
+def noted(*_):
+    with open(sys.argv[1] + ".term", "w") as f:
+        f.write("x")
+signal.signal(signal.SIGTERM, noted)
+with open(sys.argv[1], "w") as f:
+    f.write(str(os.getpid()))
+time.sleep(60)
+"""
+
+BLOB = "x" * 300000        # far more than a pipe holds (64 KiB; 4 KiB on Windows)
+
+
+def big_call(req_id) -> dict:
+    return {"jsonrpc": "2.0", "id": req_id, "method": "tools/call",
+            "params": {"name": "read_file", "arguments": {"blob": BLOB}}}
+
+
+class TestWedgedServer(ProxyCase):
+    """R5-5: the proxy wrote to the server's stdin from the one thread that
+    also answers the client. A server that stops reading fills the pipe, the
+    write blocks for good, and --timeout - which is only looked at between
+    messages - never fires: the jail hangs, and so does everyone behind it.
+    Writes now go through a thread of their own; a server that has not taken a
+    message off its stdin within --timeout of receiving it is stopped."""
+
+    @staticmethod
+    def give_up(proc) -> None:
+        """Put down a jail that hung, without waiting on pipes that a
+        leftover server may still hold open."""
+        proc.kill()
+        proc.wait(timeout=10)
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            try:
+                stream.close()
+            except OSError:
+                pass
+
+    def pid_gone(self, pidfile: str) -> bool:
+        with open(pidfile, encoding="utf-8") as f:
+            pid = int(f.read())
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        return False
+
+    def test_a_server_that_never_reads_cannot_hang_the_jail(self):
+        pidfile = os.path.join(self.tmp, "pid.txt")
+        srv = self.srv(FAKE_DEAF, "deaf.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--timeout", "2",
+             "--", sys.executable, srv, pidfile],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=child_env(), cwd=self.tmp)
+        requests = b"".join(json.dumps(big_call(i)).encode("utf-8") + b"\n"
+                            for i in range(1, 6))
+        started = time.monotonic()
+        try:
+            out, err = proc.communicate(requests, timeout=25)
+        except subprocess.TimeoutExpired:
+            self.give_up(proc)
+            self.fail("the jail hung on a server that never reads its input")
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(proc.returncode, 3, err)
+        msgs = [json.loads(l) for l in out.splitlines() if l.strip()]
+        self.assertEqual(sorted(m["id"] for m in msgs), [1, 2, 3, 4, 5])
+        for m in msgs:                      # every caller is answered
+            self.assertEqual(m["error"]["code"], -32603)
+            self.assertIn("stopped reading", m["error"]["message"])
+        self.assertIn(b"stopped reading", err)
+        self.assertNotIn(b"Traceback", err)
+        if os.name != "nt":                 # the server is not left behind
+            self.assertTrue(self.pid_gone(pidfile))
+
+    def test_the_same_in_process_with_the_exit_code(self):
+        pidfile = os.path.join(self.tmp, "pid.txt")
+        srv = self.srv(FAKE_DEAF, "deaf.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        code, raw = drive_rc(pol, [sys.executable, srv, pidfile],
+                             [big_call(1), big_call(2)], timeout=2)
+        self.assertEqual(code, 3)
+        self.assertEqual(sorted(json.loads(l)["id"] for l in raw), [1, 2])
+
+    @unittest.skipIf(os.name == "nt", "POSIX signals")
+    def test_a_stalled_server_is_killed_outright_not_asked_to_leave(self):
+        # a server that has stopped reading is not going to act on SIGTERM
+        # either: it must never get the chance to ignore it
+        pidfile = os.path.join(self.tmp, "pid.txt")
+        srv = self.srv(FAKE_DEAF_PROUD, "proud.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        code, _raw = drive_rc(pol, [sys.executable, srv, pidfile],
+                              [big_call(1), big_call(2)], timeout=2)
+        self.assertEqual(code, 3)
+        self.assertTrue(self.pid_gone(pidfile))
+        self.assertFalse(os.path.exists(pidfile + ".term"),
+                         "the stalled server was sent SIGTERM instead of being killed")
+
+    def test_an_unanswerable_notification_is_a_stall_too(self):
+        # no id, so no pending request for --timeout to expire: the write
+        # itself has to be timed
+        pidfile = os.path.join(self.tmp, "pid.txt")
+        srv = self.srv(FAKE_DEAF, "deaf.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        note = {"jsonrpc": "2.0", "method": "notifications/x", "params": {"blob": BLOB}}
+        code, raw = drive_rc(pol, [sys.executable, srv, pidfile], [note, note],
+                             timeout=2)
+        self.assertEqual(code, 3)
+        self.assertEqual(raw, [])
+
+    def test_a_server_that_is_only_slow_to_start_reading_is_left_alone(self):
+        srv = self.srv(FAKE_LATE_READER, "late.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        code, raw = drive_rc(pol, [sys.executable, srv],
+                             [big_call(1), big_call(2), big_call(3)], timeout=10)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(json.loads(l)["id"] for l in raw), [1, 2, 3])
+        self.assertTrue(all("result" in json.loads(l) for l in raw))
+
+    def test_a_burst_bigger_than_the_pipe_reaches_the_server_whole_and_in_order(self):
+        # the writer is another thread now, and 300 x 2 KB is more than a
+        # pipe holds, so it has to wait for the server again and again. The
+        # last message is a request: its answer proves the server read
+        # everything before it, in order
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_RECORDER, "rec.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        notes = [{"jsonrpc": "2.0", "method": "notifications/n%d" % i,
+                  "params": {"pad": "z" * 2000}} for i in range(300)]
+        last = {"jsonrpc": "2.0", "id": "last", "method": "tools/call",
+                "params": {"name": "read_file", "arguments": {}, "flush": True}}
+        code, raw = drive_rc(pol, [sys.executable, srv, log], notes + [last],
+                             timeout=10)
+        self.assertEqual(code, 0)
+        self.assertEqual([json.loads(l)["id"] for l in raw], ["last"])
+        with open(log, encoding="utf-8") as f:
+            seen = [json.loads(l) for l in f if l.strip()]
+        self.assertEqual([m.get("method") for m in seen[:300]],
+                         ["notifications/n%d" % i for i in range(300)])
+        self.assertEqual([m.get("id") for m in seen[300:]], ["last"])
+
+    def test_put_after_close_or_abort_is_refused(self):
+        sin = jail_mod._ServerInput(io.BytesIO(), 1.0, lambda payload: None)
+        self.assertTrue(sin.put(b"a"))
+        sin.close()
+        self.assertFalse(sin.put(b"b"))
+        sin = jail_mod._ServerInput(io.BytesIO(), 1.0, lambda payload: None)
+        sin.abort()
+        self.assertFalse(sin.put(b"c"))
+
+    def test_timeout_zero_waits_for_ever_and_stalls_nothing(self):
+        sin = jail_mod._ServerInput(io.BytesIO(), None, lambda payload: None)
+        self.assertTrue(sin.put(b"x"))
+        self.assertIsNone(sin.stall_deadline())
+        self.assertFalse(sin.stalled(time.monotonic() + 10 ** 6))
+        sin.close()
+
+    def test_server_input_on_a_full_pipe_stalls_then_reports_the_break(self):
+        r, w = os.pipe()
+        wstream = os.fdopen(w, "wb")
+        events = []
+        sin = jail_mod._ServerInput(wstream, 0.5, events.append)
+        sin.start()
+        try:
+            self.assertTrue(sin.put(b"y" * 2000000))    # never read: it blocks
+            self.assertEqual(sin.stall_deadline() is None, False)
+            self.assertFalse(sin.stalled(time.monotonic()))
+            time.sleep(0.7)
+            self.assertTrue(sin.stalled(time.monotonic()))
+            self.assertTrue(sin.alive())
+            os.close(r)                                  # the "server" goes away
+            r = None
+            sin.join(10)
+            self.assertFalse(sin.alive(), "the writer did not end with the pipe")
+            self.assertEqual(len(events), 1)
+            self.assertIsInstance(events[0], OSError)
+            self.assertFalse(sin.put(b"more"))
+        finally:
+            sin.abort()
+            if r is not None:
+                os.close(r)
+            wstream.close()
+
+    def test_windows_descriptor_is_put_in_binary_mode(self):
+        # a text-mode CRT descriptor would turn every "\n" we write into
+        # "\r\n"; this can only be checked with a stand-in for msvcrt here
+        calls = []
+
+        class FakeMsvcrt:
+            @staticmethod
+            def setmode(fd, flags):
+                calls.append((fd, flags))
+                return 0x8000
+
+        r, w = os.pipe()
+        wstream = os.fdopen(w, "wb")
+        try:
+            with mock.patch.object(jail_mod, "_WINDOWS", True), \
+                    mock.patch.dict(sys.modules, {"msvcrt": FakeMsvcrt}), \
+                    mock.patch.object(os, "O_BINARY", 0x8000, create=True):
+                sin = jail_mod._ServerInput(wstream, 1.0, lambda payload: None)
+            self.assertEqual(len(calls), 1)
+            self.assertEqual(calls[0][1], 0x8000)
+            self.assertNotEqual(calls[0][0], w)       # the duplicate, not the original
+            sin.close()
+        finally:
+            os.close(r)
+            wstream.close()
+
+
+class TestLearnWedgedServer(ProxyCase):
+    """R5-5, learn --script: the scripted client wrote to the server from the
+    thread that waits for its answers, so a server that stopped reading froze
+    learn for good, whatever --timeout said."""
+
+    DEAF_AFTER_LIST = r"""
+import json, sys, time
+for line in sys.stdin:
+    req = json.loads(line)
+    if req.get("id") is None:
+        continue
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                                 "result": {"tools": [{"name": "read_file"}]}}) + "\n")
+    sys.stdout.flush()
+    if req.get("method") == "tools/list":
+        break
+time.sleep(60)          # and never reads again
+"""
+
+    def test_script_mode_gives_up_on_a_server_that_stops_reading(self):
+        srv = self.srv(self.DEAF_AFTER_LIST, "deaf2.py")
+        script = write_script(self.tmp, [{"tool": "read_file", "arguments": {"blob": BLOB}}] * 2)
+        out = os.path.join(self.tmp, "learned.json")
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "mcp_jail", "learn", "--script", script,
+             "--out", out, "--timeout", "2", "--", sys.executable, srv],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            env=child_env(), cwd=self.tmp)
+        try:
+            so, se = proc.communicate(b"", timeout=40)
+        except subprocess.TimeoutExpired:
+            TestWedgedServer.give_up(proc)
+            self.fail("learn hung on a server that stopped reading")
+        self.assertNotIn(b"Traceback", se)
+        self.assertIn(b"timed out", se)
+
+
+class TestExitCodes(ProxyCase):
+    """R5-7: serve() returned 0 whatever had happened, so a CI job that wrapped
+    a server that died on start-up saw success. 0 is a clean session; 3 means
+    the server failed while the jail was relaying."""
+
+    def run_session(self, server_src: str, requests, timeout: float = 5, policy=None):
+        srv = self.srv(server_src, "srv2.py")
+        pol = write_policy(self.tmp, policy or ALLOW_ALL)
+        code, raw = drive_rc(pol, [sys.executable, srv], requests, timeout=timeout)
+        return code, [json.loads(l) for l in raw]
+
+    def test_a_clean_session_exits_0(self):
+        code, resps = self.run_session(FAKE_SERVER, [call(1, "read_file", {})])
+        self.assertEqual(code, 0)
+        self.assertIn("result", resps[0])
+
+    def test_a_denied_call_is_still_a_clean_session(self):
+        code, resps = self.run_session(
+            FAKE_SERVER, [call(1, "delete_all", {})],
+            policy=dict(ALLOW_ALL, deny_tools=["delete_all"]))
+        self.assertEqual(code, 0)
+        self.assertEqual(resps[0]["error"]["code"], -32602)
+
+    def test_a_server_that_exits_at_once_exits_3(self):
+        # the panel's repro: the server is gone before it reads a line
+        code, resps = self.run_session("import sys\nsys.exit(0)\n",
+                                       [call(1, "read_file", {})])
+        self.assertEqual(code, 3)
+        self.assertIn("server closed", resps[0]["error"]["message"])
+
+    def test_a_server_that_crashes_midway_exits_3(self):
+        src = ("import json, sys\n"
+               "for line in sys.stdin:\n"
+               "    req = json.loads(line)\n"
+               "    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': {}}) + '\\n')\n"
+               "    sys.stdout.flush()\n"
+               "    if req['id'] == 2:\n"
+               "        sys.exit(1)\n")
+        code, resps = self.run_session(src, [call(1, "a", {}), call(2, "a", {}), call(3, "a", {})])
+        self.assertEqual(code, 3)
+        self.assertEqual([r["id"] for r in resps if "result" in r], [1, 2])
+
+    def test_a_request_that_times_out_exits_3(self):
+        code, resps = self.run_session(FAKE_HANG, [call(1, "slow", {})], timeout=1)
+        self.assertEqual(code, 3)
+        self.assertEqual(resps[0]["error"]["message"], "server timed out")
+
+    def test_a_late_answer_that_fits_in_the_timeout_is_not_a_failure(self):
+        src = FAKE_SLOW
+        code, resps = self.run_session(src, [call(1, "t", {"delay": 0.5})], timeout=10)
+        self.assertEqual(code, 0)
+        self.assertIn("result", resps[0])
+
+    def test_the_exit_code_reaches_the_real_entry_point(self):
+        srv = self.srv("import sys\nsys.exit(0)\n", "gone.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        proc = subprocess.run(
+            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--",
+             sys.executable, srv],
+            input=json.dumps(call(1, "read_file", {})).encode() + b"\n",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=child_env(),
+            cwd=self.tmp, timeout=60)
+        self.assertEqual(proc.returncode, 3, proc.stderr)
+        self.assertNotIn(b"Traceback", proc.stderr)
+
+    def test_exit_codes_are_documented(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = f.read()
+        self.assertIn("Exit codes", readme)
+        for code in ("`0`", "`2`", "`3`"):
+            self.assertIn(code, readme)
+        text = cli_mod.build_parser().format_help()
+        self.assertIn("exit status", text.lower())
+
+
+class TestLearnLiveServerLoss(ProxyCase):
+    """R5-7, learn without --script: a server that exits mid-session is a
+    failed session like the scripted one (exit 2, --out untouched, what was
+    learned goes to stdout) - it used to be a clean exit 0."""
+
+    def test_live_learn_with_a_server_that_dies(self):
+        src = ("import json, sys\n"
+               "for line in sys.stdin:\n"
+               "    req = json.loads(line)\n"
+               "    if req.get('id') is None: continue\n"
+               "    if req['id'] == 2:\n"
+               "        sys.exit(0)          # dies with request 2 unanswered\n"
+               "    sys.stdout.write(json.dumps({'jsonrpc': '2.0', 'id': req['id'], 'result': {'content': []}}) + '\\n')\n"
+               "    sys.stdout.flush()\n")
+        srv = self.srv(src, "dies.py")
+        out = os.path.join(self.tmp, "learned.json")
+        err, so = io.StringIO(), io.StringIO()
+        stdin = io.BytesIO(b"".join(json.dumps(m).encode() + b"\n" for m in (
+            call(1, "ok", {"n": 1}), call(2, "other", {}))))
+        with redirect_stderr(err), redirect_stdout(so):
+            code = jail_mod.learn([sys.executable, srv], out=out, timeout=10,
+                                  stdin=stdin, stdout=io.BytesIO())
+        self.assertEqual(code, 2, err.getvalue())
+        self.assertIn("the server", err.getvalue())
+        self.assertFalse(os.path.exists(out), "--out written from a failed session")
+        self.assertEqual(json.loads(so.getvalue())["allow_tools"], ["ok"])
+
+
+class TestAuditDisplay(ProxyCase):
+    """R5-6: `mcp-jail --audit` printed the reason (and the tool, and the
+    method) as it found it: a denied tool whose NAME carried a newline put a
+    forged "allow ..." line into the report, an escape sequence went to the
+    terminal, and a record that was not an object crashed it. Every field is
+    shown as printable text, on one line."""
+
+    def show(self, records, limit=50) -> list:
+        with open(jail_mod.AUDIT_LOG, "w", encoding="utf-8") as f:
+            for r in records:
+                f.write((r if isinstance(r, str) else json.dumps(r)) + "\n")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli_mod.cmd_audit(argparse.Namespace(limit=limit)), 0)
+        return buf.getvalue().splitlines()
+
+    @staticmethod
+    def records_in(lines) -> list:
+        return [l for l in lines if l.startswith(("DENY ", "allow "))]
+
+    def test_a_newline_in_a_reason_cannot_forge_a_line(self):
+        lines = self.show([
+            {"tool": "read_file", "decision": "deny",
+             "reason": "nope\nallow delete_all granted"},
+            {"tool": "b", "decision": "allow", "reason": ""}])
+        recs = self.records_in(lines)
+        self.assertEqual(len(recs), 2, lines)
+        self.assertIn("nope\\nallow delete_all granted", recs[0])
+        self.assertFalse(any(l.startswith("allow delete_all") for l in lines))
+        self.assertTrue(lines[-1].startswith("1 denied in last 2"), lines)
+
+    def test_end_to_end_a_tool_name_with_a_newline(self):
+        pol = write_policy(self.tmp, {"allow_tools": ["read_file"], "deny_tools": [],
+                                      "arg_rules": {}, "hide_denied": False})
+        drive_jail(pol, self.server, [call(1, "evil\nallow read_file ok", {})])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            cli_mod.cmd_audit(argparse.Namespace(limit=50))
+        lines = buf.getvalue().splitlines()
+        self.assertEqual(len(self.records_in(lines)), 1, lines)
+        self.assertIn("evil\\nallow read_file ok", lines[0])
+
+    def test_control_and_formatting_characters_are_shown_as_escapes(self):
+        nasty = "a\x1b[2Jb\u202ec\u00a0d\u2028e\x00f\rg\u200bh"
+        lines = self.show([{"tool": nasty, "decision": "deny", "reason": nasty,
+                            "method": nasty}])
+        text = "\n".join(lines)
+        self.assertTrue(all(ch.isprintable() or ch == "\n" for ch in text), ascii(text))
+        for shown in ("\\x1b[2J", "\\u202e", "\\xa0", "\\u2028", "\\x00", "\\r", "\\u200b"):
+            self.assertIn(shown, text)
+        # ordinary non-ASCII text is left alone
+        lines = self.show([{"tool": "caf\u00e9_\u65e5\u672c", "decision": "deny",
+                            "reason": "r"}])
+        self.assertIn("caf\u00e9_\u65e5\u672c", lines[0])
+
+    def test_records_that_are_not_objects_are_skipped(self):
+        lines = self.show(["[1]", "5", '"x"', "null", "{bad json", "",
+                           {"tool": "t", "decision": "deny", "reason": "r"}])
+        self.assertEqual(len(self.records_in(lines)), 1, lines)
+
+    def test_fields_that_are_not_strings(self):
+        lines = self.show([{"tool": 5, "decision": "deny", "reason": {"a": "b\nc"}},
+                           {"decision": ["x"], "tool": ["a\nb"]},
+                           {"tool": None, "method": 7, "decision": "deny", "reason": None}])
+        self.assertEqual(len(self.records_in(lines)), 3, lines)
+
+    def test_rejected_messages_are_listed_as_such(self):
+        lines = self.show([
+            {"decision": "deny", "rejected": "client", "reason": "raw control character U+000D"},
+            {"decision": "deny", "rejected": "server", "reason": "duplicate key 'id'"}])
+        recs = self.records_in(lines)
+        self.assertEqual(recs[0], "DENY  client message raw control character U+000D")
+        self.assertEqual(recs[1], "DENY  server message duplicate key 'id'")
+
+    def test_a_log_that_is_not_utf8_is_still_shown(self):
+        with open(jail_mod.AUDIT_LOG, "wb") as f:
+            f.write(b'{"tool": "x\xff", "decision": "deny", "reason": "r"}\n')
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(cli_mod.cmd_audit(argparse.Namespace(limit=50)), 0)
+        self.assertEqual(len(self.records_in(buf.getvalue().splitlines())), 1)
+
+
+# Reads slowly, so the end of a burst is still waiting in its pipe when the
+# client has gone; notes every line it gets.
+FAKE_SLOW_RECORDER = r"""
+import sys, time
+log = open(sys.argv[1], "a", encoding="utf-8")
+for line in sys.stdin:
+    time.sleep(0.005)
+    log.write(line); log.flush()
+"""
+
+# Answers each request after a moment, and says goodbye when its input closes.
+FAKE_BYE = r"""
+import json, sys, time
+for line in sys.stdin:
+    req = json.loads(line)
+    if req.get("id") is None:
+        continue
+    time.sleep(0.005)
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req["id"],
+                                 "result": {"n": req["id"]}}) + "\n")
+    sys.stdout.flush()
+sys.stdout.write(json.dumps({"jsonrpc": "2.0", "method": "notifications/message",
+                             "params": {"level": "info", "data": "bye"}}) + "\n")
+sys.stdout.flush()
+"""
+
+# Notices that its input has closed, and carries on regardless. With a second
+# argument it also ignores SIGTERM (noting that it was sent one).
+FAKE_STUBBORN = r"""
+import os, signal, sys, time
+pidfile = sys.argv[1]
+with open(pidfile, "w") as f:
+    f.write(str(os.getpid()))
+if len(sys.argv) > 2:
+    def noted(*_):
+        with open(pidfile + ".term", "w") as f:
+            f.write("x")
+    signal.signal(signal.SIGTERM, noted)
+for line in sys.stdin:
+    pass
+with open(pidfile + ".eof", "w") as f:
+    f.write("eof")
+time.sleep(60)
+"""
+
+# Leaves when its input closes, but a helper it started goes on holding the
+# output pipe open for a couple of seconds more.
+FAKE_LEAVES_A_HELPER = r"""
+import subprocess, sys
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(2)"])
+for line in sys.stdin:
+    pass
+"""
+
+NOTE = {"jsonrpc": "2.0", "method": "notifications/x", "params": {}}
+
+
+class TestGracefulShutdown(ProxyCase):
+    """Once the client's input ends and every request is answered, the jail
+    does what the MCP stdio transport asks of a client that is leaving: it
+    closes the server's input, gives the server --grace seconds to finish
+    what it was sent and exit (everything it still says is relayed), then
+    stops it: SIGTERM, then a kill (terminate() on Windows). It used to stop
+    the server the moment its own work was done, and a server that had not
+    yet read the last of a burst from its pipe lost it."""
+
+    pid_gone = TestWedgedServer.pid_gone
+
+    def timed(self, *args, **kw):
+        started = time.monotonic()
+        result = drive_rc(*args, **kw)
+        return result, time.monotonic() - started
+
+    def stubborn(self, *extra):
+        pidfile = os.path.join(self.tmp, "pid.txt")
+        srv = self.srv(FAKE_STUBBORN, "stubborn.py")
+        return pidfile, [sys.executable, srv, pidfile] + list(extra)
+
+    def test_a_burst_of_notifications_then_the_end_of_input_reaches_the_server_whole(self):
+        log = os.path.join(self.tmp, "seen.txt")
+        srv = self.srv(FAKE_SLOW_RECORDER, "slow_rec.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        notes = [{"jsonrpc": "2.0", "method": "notifications/n%d" % i,
+                  "params": {"pad": "z" * 2000}} for i in range(100)]
+        for attempt in range(2):
+            if os.path.exists(log):
+                os.remove(log)
+            code, raw = drive_rc(pol, [sys.executable, srv, log], notes,
+                                 timeout=10)
+            self.assertEqual((code, raw), (0, []))
+            with open(log, encoding="utf-8") as f:
+                seen = [json.loads(l)["method"] for l in f if l.strip()]
+            self.assertEqual(seen, ["notifications/n%d" % i for i in range(100)],
+                             f"attempt {attempt}")
+
+    def test_a_burst_of_requests_then_the_end_of_input_is_answered_in_full(self):
+        srv = self.srv(FAKE_BYE, "bye.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        reqs = [{"jsonrpc": "2.0", "id": i, "method": "tools/call",
+                 "params": {"name": "read_file",
+                            "arguments": {"pad": "z" * 2000}}}
+                for i in range(1, 81)]
+        for attempt in range(2):
+            code, raw = drive_rc(pol, [sys.executable, srv], reqs, timeout=10)
+            self.assertEqual(code, 0)
+            answers = [m for m in map(json.loads, raw) if "id" in m]
+            self.assertEqual(sorted(m["id"] for m in answers), list(range(1, 81)),
+                             f"attempt {attempt}")
+            self.assertTrue(all("result" in m for m in answers))
+
+    def test_what_the_server_says_when_its_input_closes_is_still_relayed(self):
+        srv = self.srv(FAKE_BYE, "bye.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        code, raw = drive_rc(pol, [sys.executable, srv], [
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+             "params": {"name": "read_file", "arguments": {}}}])
+        msgs = [json.loads(l) for l in raw]
+        self.assertEqual(code, 0)
+        self.assertEqual(msgs[0].get("id"), 1)
+        self.assertEqual([m.get("method") for m in msgs[1:]],
+                         ["notifications/message"])
+
+    def test_a_server_that_leaves_when_its_input_closes_is_not_waited_on_longer(self):
+        srv = self.srv(FAKE_BYE, "bye.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            (code, raw), took = self.timed(
+                pol, [sys.executable, srv],
+                [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "read_file", "arguments": {}}}],
+                grace=30)
+        self.assertEqual(code, 0)
+        self.assertLess(took, 10)
+        self.assertNotIn("did not exit", err.getvalue())
+
+    def test_a_server_that_ignores_the_end_of_its_input_is_stopped_after_the_grace(self):
+        pidfile, cmd = self.stubborn()
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            (code, raw), took = self.timed(pol, cmd, [NOTE], grace=2.0)
+        self.assertEqual((code, raw), (0, []))
+        self.assertGreaterEqual(took, 2.0)      # it was given its two seconds
+        self.assertLess(took, 20)
+        self.assertTrue(os.path.exists(pidfile + ".eof"))   # its input was closed
+        self.assertIn("did not exit within 2s", err.getvalue())
+        if os.name != "nt":
+            self.assertTrue(self.pid_gone(pidfile))
+
+    @unittest.skipIf(os.name == "nt", "POSIX signals; terminate() on Windows "
+                     "is TerminateProcess, which nothing can ignore")
+    def test_a_server_that_ignores_sigterm_as_well_is_killed(self):
+        pidfile, cmd = self.stubborn("proud")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        with mock.patch.object(jail_mod, "_TERM_WAIT", 0.5), \
+                redirect_stderr(io.StringIO()):
+            code, raw = drive_rc(pol, cmd, [NOTE], grace=2.0)
+        self.assertEqual((code, raw), (0, []))
+        self.assertTrue(os.path.exists(pidfile + ".eof"))
+        self.assertTrue(os.path.exists(pidfile + ".term"))  # asked politely first
+        self.assertTrue(self.pid_gone(pidfile))             # then not asked
+
+    @unittest.skipIf(os.name == "nt", "whether a helper inherits the pipe is "
+                     "a Windows handle-inheritance question; POSIX descriptors "
+                     "are simply inherited")
+    def test_a_helper_that_holds_the_servers_output_open_is_named_as_the_wait(self):
+        # mcp-jail cannot close the pipe under its own reader, so it does wait
+        # for the helper (see Limitations); it says why instead of blaming a
+        # server that has in fact gone
+        srv = self.srv(FAKE_LEAVES_A_HELPER, "helper.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code, raw = drive_rc(pol, [sys.executable, srv], [NOTE], grace=0.5)
+        self.assertEqual((code, raw), (0, []))
+        self.assertIn("server has exited, but something it started still "
+                      "has its output open", err.getvalue())
+        self.assertNotIn("did not exit", err.getvalue())
+
+    def test_grace_0_stops_the_server_at_once(self):
+        pidfile, cmd = self.stubborn()
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            (code, raw), took = self.timed(pol, cmd, [NOTE], grace=0)
+        self.assertEqual((code, raw), (0, []))
+        self.assertLess(took, 10)
+        self.assertNotIn("did not exit", err.getvalue())
+        # it may have been stopped before it wrote its pid down
+        if os.name != "nt" and os.path.exists(pidfile):
+            self.assertTrue(self.pid_gone(pidfile))
+
+    def test_a_failed_session_does_not_wait_for_the_grace(self):
+        # the server stopped reading: it is killed, not given 30 s to leave
+        pidfile = os.path.join(self.tmp, "pid.txt")
+        srv = self.srv(FAKE_DEAF, "deaf.py")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        with redirect_stderr(io.StringIO()):
+            (code, raw), took = self.timed(
+                pol, [sys.executable, srv, pidfile],
+                [big_call(1), big_call(2)], timeout=2, grace=30)
+        self.assertEqual(code, 3)
+        self.assertLess(took, 20)
+
+    def test_a_server_that_timed_out_is_not_given_the_grace_either(self):
+        # it never answers the request and ignores the end of its input
+        pidfile, cmd = self.stubborn()
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        with redirect_stderr(io.StringIO()):
+            (code, raw), took = self.timed(
+                pol, cmd,
+                [{"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                  "params": {"name": "read_file", "arguments": {}}}],
+                timeout=1, grace=30)
+        self.assertEqual(code, 3)
+        self.assertLess(took, 20)
+        self.assertEqual([json.loads(l)["error"]["message"] for l in raw],
+                         ["server timed out"])
+
+    def test_the_command_line_passes_the_grace_on(self):
+        pidfile, cmd = self.stubborn()
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        started = time.monotonic()
+        proc = subprocess.run(
+            [sys.executable, "-m", "mcp_jail", "--policy", pol, "--grace", "1",
+             "--"] + cmd,
+            input=b"", capture_output=True, env=child_env(), cwd=self.tmp,
+            timeout=60)
+        took = time.monotonic() - started
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertGreaterEqual(took, 1.0)
+        self.assertLess(took, 30)
+        self.assertIn(b"did not exit within 1s", proc.stderr)
+        if os.name != "nt" and os.path.exists(pidfile):
+            self.assertTrue(self.pid_gone(pidfile))
+
+    def test_grace_defaults_to_5_seconds_and_is_in_the_help(self):
+        self.assertEqual(jail_mod.DEFAULT_GRACE, 5.0)
+        args = cli_mod.build_parser().parse_args(["--", "x"])
+        self.assertEqual(args.grace, 5.0)
+        self.assertIn("--grace", cli_mod.build_parser().format_help())
+        out = io.StringIO()
+        with redirect_stdout(out), self.assertRaises(SystemExit) as cm:
+            cli_mod.cmd_learn(["--help"])
+        self.assertEqual(cm.exception.code, 0)
+        self.assertIn("--grace", out.getvalue())
+
+    def test_readme_describes_the_shutdown_and_no_longer_owns_up_to_the_race(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())
+        for needle in ("`--grace N` (default 5; `0` stops the server at once)",
+                       "SIGTERM"):
+            self.assertTrue(needle in readme, f"the README does not say {needle}")
+        limits = readme.split("## Limitations", 1)[1].split(" ## ", 1)[0]
+        self.assertFalse("stopped as soon as" in limits,
+                         "the Limitations still own up to the race")
+        self.assertTrue("holds the server's *output* open is waited for" in limits,
+                        "the Limitations do not say a helper holding the "
+                        "output delays the exit")
+
+
+class TestSecondsOptions(ProxyCase):
+    """--timeout and --grace are a number of seconds. float() also takes
+    "nan", "inf" and a minus sign: nan and a negative value quietly meant "no
+    timeout", and inf (or 1e12) died with an OverflowError traceback in the
+    first wait."""
+
+    OPTIONS = ("--timeout", "--grace")
+    BAD = ["nan", "NaN", "inf", "-inf", "Infinity", "-1", "-0.5", "abc", ""]
+    GOOD = ["0", "0.5", "30", "1e3", "1e12"]
+
+    def refused(self, parse, args) -> str:
+        err = io.StringIO()
+        with redirect_stderr(err), self.assertRaises(SystemExit) as cm:
+            parse(args)
+        self.assertEqual(cm.exception.code, 2)
+        return err.getvalue()
+
+    def test_the_parser_refuses_a_bad_value_and_names_the_option(self):
+        for opt in self.OPTIONS:
+            for bad in self.BAD:
+                with self.subTest(option=opt, value=bad):
+                    text = self.refused(cli_mod.build_parser().parse_args,
+                                        [opt, bad, "--", "x"])
+                    self.assertIn(opt, text)
+                    self.assertNotIn("Traceback", text)
+
+    def test_learn_refuses_them_too(self):
+        for opt in self.OPTIONS:
+            for bad in self.BAD:
+                with self.subTest(option=opt, value=bad):
+                    text = self.refused(cli_mod.cmd_learn, [opt, bad, "--", "x"])
+                    self.assertIn(opt, text)
+
+    def test_ordinary_values_are_still_accepted(self):
+        for opt in self.OPTIONS:
+            for good in self.GOOD:
+                with self.subTest(option=opt, value=good):
+                    args = cli_mod.build_parser().parse_args([opt, good, "--", "x"])
+                    self.assertEqual(getattr(args, opt[2:]), float(good))
+
+    def test_a_bad_value_ends_in_exit_2_and_never_starts_the_server(self):
+        started = os.path.join(self.tmp, "started")
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        for opt in self.OPTIONS:
+            for bad in ("nan", "inf", "-1"):
+                with self.subTest(option=opt, value=bad):
+                    proc = subprocess.run(
+                        [sys.executable, "-m", "mcp_jail", "--policy", pol,
+                         opt, bad, "--", sys.executable, "-c",
+                         "open(%r, 'w').close()" % started],
+                        input=b"", capture_output=True, env=child_env(),
+                        cwd=self.tmp, timeout=60)
+                    self.assertEqual(proc.returncode, 2, proc.stderr)
+                    self.assertIn(opt.encode(), proc.stderr)
+                    self.assertNotIn(b"Traceback", proc.stderr)
+                    self.assertFalse(os.path.exists(started))
+
+    def test_the_library_entry_points_refuse_them_without_a_server(self):
+        started = os.path.join(self.tmp, "started")
+        cmd = [sys.executable, "-c", "open(%r, 'w').close()" % started]
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        for name in ("timeout", "grace"):
+            for bad in (float("nan"), float("inf"), -1.0):
+                with self.subTest(option=name, value=bad):
+                    err = io.StringIO()
+                    with redirect_stderr(err):
+                        run_code = jail_mod.run(pol, cmd, stdin=io.BytesIO(b""),
+                                                stdout=io.BytesIO(), **{name: bad})
+                        learn_code = jail_mod.learn(cmd, stdin=io.BytesIO(b""),
+                                                    stdout=io.BytesIO(), **{name: bad})
+                    self.assertEqual((run_code, learn_code), (2, 2))
+                    self.assertEqual(err.getvalue().count("--" + name), 2,
+                                     err.getvalue())
+                    self.assertFalse(os.path.exists(started))
+
+    def test_a_huge_timeout_is_not_a_crash(self):
+        pol = write_policy(self.tmp, ALLOW_ALL)
+        resps = drive_jail(pol, self.server,
+                           [{"jsonrpc": "2.0", "id": 1, "method": "tools/list"}],
+                           timeout=1e12)
+        self.assertEqual([r["id"] for r in resps], [1])
+
+    def test_learn_with_timeout_0_waits_for_ever_like_the_proxy_does(self):
+        # it used to be a deadline that had already passed: every answer a
+        # moment too late
+        src = ("import json, sys, time\n"
+               "for line in sys.stdin:\n"
+               "    req = json.loads(line)\n"
+               "    time.sleep(0.5)\n"
+               "    sys.stdout.write(json.dumps({'jsonrpc': '2.0', "
+               "'id': req['id'], 'result': {}}) + '\\n')\n"
+               "    sys.stdout.flush()\n")
+        proc = jail_mod._spawn([sys.executable, self.srv(src, "slow.py")])
+        session = jail_mod._Session(proc)
+        try:
+            status = session.request(
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"}, 0)
+        finally:
+            session.close()
+            jail_mod._stop(proc)
+        self.assertEqual(status[0], "ok")
+
+    def test_readme_says_which_values_are_refused(self):
+        with open(os.path.join(REPO, "README.md"), encoding="utf-8") as f:
+            readme = " ".join(f.read().split())     # line breaks do not matter
+        for needle in ("`nan`, `inf` and negative values are refused",
+                       "is a directory, or cannot be read"):
+            self.assertTrue(needle in readme, f"the README does not say {needle}")
+
+    def test_a_policy_path_that_cannot_be_read_is_exit_2_not_a_traceback(self):
+        # a directory is IsADirectoryError on POSIX and PermissionError on
+        # Windows; both are OSError
+        started = os.path.join(self.tmp, "started")
+        cmd = [sys.executable, "-c", "open(%r, 'w').close()" % started]
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = jail_mod.run(self.tmp, cmd, stdin=io.BytesIO(b""),
+                                stdout=io.BytesIO())
+        self.assertEqual(code, 2)
+        self.assertIn("cannot read the policy", err.getvalue())
+        self.assertFalse(os.path.exists(started))
+
+    def test_a_policy_nested_beyond_the_parser_is_exit_2_too(self):
+        path = os.path.join(self.tmp, "deep.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("[" * 200000)
+        err = io.StringIO()
+        with redirect_stderr(err):
+            code = jail_mod.run(path, [sys.executable, "-c", "pass"],
+                                stdin=io.BytesIO(b""), stdout=io.BytesIO())
+        self.assertEqual(code, 2)
+        self.assertIn("bad policy", err.getvalue())
+
+
+class TestHarnessIsHermetic(unittest.TestCase):
+    """Most tests run the jail in this process (drive_rc), so the servers it
+    starts inherit this process's environment. PYTHONUNBUFFERED in it would
+    hide a server that forgot to flush, which hangs for a real client."""
+
+    def test_a_server_the_jail_starts_does_not_inherit_pythonunbuffered(self):
+        proc = jail_mod._spawn(
+            [sys.executable, "-c",
+             "import os; print(os.environ.get('PYTHONUNBUFFERED'))"])
+        try:
+            out = proc.stdout.read()
+        finally:
+            jail_mod._stop(proc)
+        self.assertEqual(out.strip(), b"None")
+        self.assertNotIn("PYTHONUNBUFFERED", child_env())
 
 
 if __name__ == "__main__":

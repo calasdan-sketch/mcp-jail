@@ -11,7 +11,8 @@ line — never execution.
 any other method you list in `policed_methods`, such as `prompts/get`
 or `resources/read`). Whole JSON-RPC methods can be refused with
 `deny_methods`. Everything else — resources, prompts, completions,
-notifications, server-to-client requests — passes through untouched.
+notifications, server-to-client requests — is relayed unchecked (though
+re-serialised, see *Protocol handling*).
 
 Zero client changes: swap the server command for the jail wrapper.
 
@@ -44,6 +45,7 @@ mcp-jail --version
 mcp-jail --init-policy                       # annotated starter policy
 mcp-jail --policy policy.json -- npx -y some-mcp-server
 mcp-jail --policy policy.json --timeout 10 -- npx -y some-mcp-server
+mcp-jail --policy policy.json --grace 10 -- npx -y some-mcp-server
 mcp-jail --audit                             # who got denied lately
 mcp-jail learn --script calls.json --out policy.json -- npx -y some-mcp-server
 mcp-jail --help                              # every flag, explained
@@ -68,6 +70,20 @@ Policy (`policy.json`):
 }
 ```
 
+The policy is checked when mcp-jail starts, and anything it cannot read
+unambiguously is refused (exit `2`, the server is never started): an
+**unknown key** at any level — the top level, or inside an `arg_rules`
+entry, which takes only `allow` and `deny` — with a suggestion
+(`unknown key 'alow_tools' (did you mean 'allow_tools'?)`); a
+**duplicate key** (a JSON reader keeps only the last one, so a second
+`deny_tools` would silently replace the first); a tool list that holds
+anything but non-empty strings; a bad regex. `_comment` (and
+`_not_called`, which `learn` writes) are notes and are never read.
+Leaving `allow_tools` out is allowed and means "every tool that
+`deny_tools` does not name"; write `"allow_tools": []` to allow nothing.
+A policy path that is a directory, or cannot be read, is the same exit
+`2`, not a traceback.
+
 - `allow_tools` / `deny_tools`: tool names (`*` = all). Deny wins.
   Names are compared **normalised** — Unicode NFKC, case-folded,
   trimmed, invisible characters (zero-width space, soft hyphen, BOM,
@@ -83,14 +99,25 @@ Policy (`policy.json`):
   `array`; either key may be omitted). A tool's `"allow"` may also be
   the string `"*"`: any arguments (deny rules still apply).
 - `policed_methods` (default `["tools/call"]`): the JSON-RPC methods
-  whose parameters go through the tool policy. `tools/call` is always
-  policed; add `prompts/get` (checked by `params.name` /
-  `params.arguments`) or `resources/read` (by `params.uri`) to police
-  those too, with the same `allow_tools` / `deny_tools` / `arg_rules`.
-  `hide_denied` only filters `tools/list`.
+  whose parameters go through the tool policy (`allow_tools` /
+  `deny_tools` / `arg_rules`). `tools/call` is always policed. Each
+  method is judged by the field that really selects what the call
+  touches, and by nothing else: `tools/call` and `prompts/get` by
+  `params.name` (with `params.arguments` as the arguments);
+  `resources/read`, `resources/subscribe` and `resources/unsubscribe` by
+  `params.uri`; `completion/complete` by its `params.ref`, the `name` of
+  a `ref/prompt` or the `uri` of a `ref/resource`; any other method you
+  list, by whichever of `name` and `uri` it carries (exactly one). A
+  second selector beside the right one
+  (`{"uri": "file:///etc/passwd", "name": "harmless"}`), a `ref` that is
+  both kinds, or a selector that is missing or not a string is refused
+  with `-32602`: a server need not make the choice the jail would. The
+  selector is compared the way a tool name is, with case ignored (see
+  *Limitations*). `hide_denied` only filters `tools/list`.
 - `deny_methods` (default `[]`): methods refused outright with `-32601`
   and an audit line — exact names or globs (`resources/*`,
-  `prompts/get`). Notifications matching it are dropped.
+  `prompts/get`), matched as written and ignoring case. Notifications
+  matching it are dropped.
 - `strict_args` (default `false`): when `true`, a tool with no allow
   patterns accepts only *empty* arguments — `{}` and nothing else; an
   empty object or array inside (`{"q": {}}`) is a value and is refused.
@@ -105,17 +132,60 @@ Policy (`policy.json`):
 
 Every allowed/denied call lands in `~/.mcp-jail/audit.jsonl`
 (`%USERPROFILE%\.mcp-jail\audit.jsonl` on Windows): tool, decision,
-reason, timestamp. The file is created with mode `0600` (owner only;
-best effort on Windows, where the per-user profile is the fence) and,
-by default, carries argument values **only for denied calls** — the
-arguments of allowed calls are routinely tokens, file contents and
-prompts, and a log of them is a second copy of your secrets. Logged
-string values are cut to 200 characters. `audit_args: "all"` turns full
+reason, timestamp. A message the jail would not relay at all (see
+*Protocol handling*) is a `deny` record too, with `rejected` set to
+`client` or `server` and no tool. The file is created with mode `0600`
+(owner only; best effort on Windows, where the per-user profile is the
+fence) and, by default, carries argument values **only for denied
+calls** — the arguments of allowed calls are routinely tokens, file
+contents and prompts, and a log of them is a second copy of your
+secrets. Logged string values are cut to 200 characters. `audit_args: "all"` turns full
 logging on if you want it.
 
-`--timeout N` (default 30): seconds to wait for each server response
-before the jail fails closed with a JSON-RPC timeout error. A silent
-or wedged server can never hang your client.
+`--timeout N` (default 30; `0` waits for ever): seconds to wait for each
+server response before the jail fails closed with a JSON-RPC timeout
+error, and for the server to take each message off its stdin. N is a
+finite number, 0 or more: `nan`, `inf` and negative values are refused
+(exit `2`, nothing started). A silent
+or wedged server can never hang your client: messages for the server
+are queued and written by a thread of their own, so a server that has
+stopped reading (its pipe is full: it hung, deadlocked, or is busy for
+good) cannot freeze the jail. A message that has waited longer than N
+seconds to be taken is a stall: every request still waiting gets
+`-32603 server stopped reading its input`, the server is killed, and
+mcp-jail exits `3`.
+
+`--grace N` (default 5; `0` stops the server at once): when the client
+closes its input and every request has been answered, mcp-jail does what
+the MCP stdio transport asks of a client that is leaving. It finishes
+writing what is queued, closes the server's stdin, and waits up to N
+seconds for the server to finish and exit, relaying (and checking, and
+auditing) whatever the server still says meanwhile, a last notification
+for one. A server still running after N seconds is sent SIGTERM (on
+Windows `terminate()`, which ends it outright) and, if it ignores that
+for five more seconds, is killed; mcp-jail says so on stderr and still
+exits `0`. A session that failed (exit `3`) does not wait. So a burst of
+notifications sent just before the client went away reaches the server in
+full, which `--grace 0` (stop the server as soon as the jail's own work is
+done, the way mcp-jail used to) can lose. `learn` without `--script` ends
+its session the same way and takes `--grace` too.
+
+`mcp-jail --audit` shows every field of a record as printable text on
+one line: a newline, a terminal escape sequence or a bidi override in a
+reason or a tool name (the client chooses it) is shown as an escape
+(`\n`, `\x1b`, `\u202e`), so it cannot forge a line of the report or
+drive your terminal.
+
+## Exit codes
+
+| code | meaning |
+|------|---------|
+| `0`  | a clean session: the client finished and every request it sent was answered (a denied call is the jail doing its job, not a failure); or `--audit` / `--init-policy` / `learn` succeeded |
+| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not on `PATH`, an option value that is not a finite number of seconds, a `learn` session that ended early |
+| `3`  | the server failed while the jail was relaying: it exited or closed its pipes while the client was still talking to it, stopped reading its input, or left a request unanswered past `--timeout` |
+
+A wrapper (a CI job, a supervisor) can tell a server that died on
+start-up from a session that ran.
 
 ## Argument paths
 
@@ -286,16 +356,17 @@ tools called, successful calls, the server's MCP revision) goes to
 stderr. Review the generated file before enforcing it — it permits
 exactly what was seen, nothing more; to let one tool take any
 arguments, set its `"allow"` to `"*"`. A server that hangs during
-`learn` times out per `--timeout` instead of wedging the session.
+`learn` times out per `--timeout` (`0` waits for ever) instead of wedging
+the session.
 Banner or log lines the server prints to stdout are reported and
 skipped.
 
 `learn` never ends in a traceback and never destroys a good policy: the
 directory of `--out` is created (or refused) before the server starts;
-if the server goes away mid-session — refuses the handshake, exits,
-closes its pipes — `learn` says so and exits `2` **without writing
-`--out`**, printing whatever partial policy it had to stdout for
-review; if the final write to `--out` fails, the policy is printed to
+if the server goes away mid-session (scripted or live) — refuses the
+handshake, exits, closes its pipes, stops reading its input — `learn`
+says so and exits `2` **without writing `--out`**, printing whatever
+partial policy it had to stdout for review; if the final write to `--out` fails, the policy is printed to
 stdout instead of being lost.
 
 ## Protocol handling
@@ -307,26 +378,61 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
   the same id and type as the request. A denied *notification* (no id)
   is audited and dropped — notifications never get a response. A
   request with `"id": null` (forbidden by MCP) gets `-32600`.
-- A policed request (`tools/call`, plus `policed_methods`) is forwarded
-  **re-serialised from the object the policy checked**, never as the
-  client's bytes; every other message passes through byte-for-byte. A
-  method in `deny_methods` gets `-32601` and an audit line. A document
-  with duplicate keys anywhere (`{"name":"delete_all","name":"read_file"}`
-  — which tool that names depends on who parses it) is refused with
-  `-32600` from the client; from the server, the request it names (by
-  id) fails with `-32603 bad response from server`.
-- Upstream responses are passed through byte-for-byte; only
-  `tools/list` results are re-serialised when `hide_denied` filters
-  them. Server notifications (`notifications/message`, progress,
+- **Both directions carry the jail's own encoding, never the peer's
+  bytes.** Every message, from the client and from the server, is
+  parsed strictly and, once checked, **re-serialised** as compact,
+  pure-ASCII JSON (every non-ASCII character an escape; no `NaN`,
+  `Infinity` or whitespace padding). What the jail checked is then
+  exactly what the other side parses. Two parsers reading the same
+  bytes differently is how a filter gets bypassed: a Java server that
+  ends a line at a bare CR runs a second, unchecked `tools/call`
+  smuggled into the first, and a document with a key twice
+  (`{"name":"delete_all","name":"read_file"}`) names whichever tool the
+  reader keeps. So a message that is not one clean JSON line is
+  **refused**, not repaired: a raw control character anywhere in the
+  line (CR, TAB, NUL, ...; JSON has `\r` and `\t` for text), a
+  duplicate key at any depth, `NaN` / `Infinity` / a number a double
+  cannot hold (`1e999`), invalid UTF-8, a request without a string
+  `method`, a response that is not exactly one of `result` and `error`
+  (or that also names a `method`). A refused client message gets
+  `-32700` / `-32600` under its own id (null when it has none, or none
+  that can be trusted), a refused server message fails the request it
+  answers (`-32603 bad response from server: ...`) or is dropped with a
+  line on stderr, and each lands in the audit log as a `deny` record
+  with `rejected` set to `client` or `server` (the offending line, cut
+  to 200 characters, is kept unless `audit_args` is `none`).
+  Integers of any size are exact; a decimal with more digits than an
+  IEEE double holds is rounded to the nearest double, as every
+  double-based parser would (see *Limitations*).
+- **Member names are exact.** Some JSON readers (Go's `encoding/json`,
+  C#'s `System.Text.Json` and Jackson when so configured) match member
+  names without regard to case and let the last duplicate win, so
+  `{"method":"ping","METHOD":"tools/call"}` is a ping to the jail and a
+  tool call to such a server. A message with a member that is another
+  spelling of `jsonrpc`, `id`, `method`, `params`, `result` or `error`
+  (another case, a Unicode fold such as U+017F for `s`, invisible
+  characters), or, in the `params` of a policed method, of `name`,
+  `arguments`, `uri` or `ref`, is refused (`-32600`; `-32602` for
+  `params`) and never normalised. The same goes for what the server
+  sends: the envelope, `result.tools` / `nextCursor` of a `tools/list`
+  page (the request fails closed), and each tool's `name` (an entry whose
+  `name` has a second spelling is hidden, since `hide_denied` cannot tell
+  which tool it names). Method *values* are read the way a
+  case-insensitive router would: `Tools/Call` is policed as `tools/call`
+  and `RESOURCES/LIST` is denied by `resources/*`.
+- A method in `deny_methods` gets `-32601` and an audit line.
+  Server notifications (`notifications/message`, progress,
   `tools/list_changed`) and server-to-client requests (sampling,
-  roots, elicitation) pass straight through, and the client's answers
-  go straight back. A batch response from the server is delivered
-  once, as one array.
+  roots, elicitation) are relayed, and the client's answers go back to
+  the server, all re-serialised as above. `tools/list` results are
+  filtered in place when `hide_denied` is on. A batch response from the
+  server is delivered once, as one array.
 - JSON-RPC batch arrays from the client are split and handled element
   by element.
 - A request the server never answers within `--timeout` gets a
-  `-32603 server timed out` error; a response that arrives later for
-  that id is dropped, so the client never sees two answers. A non-JSON
+  `-32603 server timed out` error (and the session ends with exit status
+  `3`); a response that arrives later for that id is dropped, so the
+  client never sees two answers. A non-JSON
   line on the server's stdout (npm servers `console.log()` banners and
   progress there) answers nothing: it is reported on stderr and
   skipped, never charged to a pending request, whose real answer still
@@ -335,13 +441,39 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
   including JSON nested a hundred thousand levels deep, which is an
   attack on the proxy's stack, not a reason for it to exit.
 - When the server exits, pending requests fail with `-32603 server
-  closed` and the proxy exits cleanly, even while the client still
-  holds its stdin open. When *our* stdout's reader goes away
-  (`mcp-jail --audit | head`), mcp-jail exits quietly.
+  closed` and the proxy ends the session without a crash, even while
+  the client still holds its stdin open - with exit status `3`. When
+  *our* stdout's reader goes away (`mcp-jail --audit | head`),
+  mcp-jail exits quietly.
 - Wire format: newline-delimited JSON, UTF-8 regardless of console
   code page. Both pipes are pumped by reader threads into one queue —
   no `select()` on pipes — so it runs the same on Windows 11 as on
   Linux/macOS.
+
+## Limitations
+
+What mcp-jail does not do, in plain words (the two caveats on deny
+patterns and on `learn` above apply as well):
+
+- **A URI in `allow_tools` is compared like a tool name**: NFKC-normalised
+  and case-folded. A policy that allows `file:///srv/Public` also allows
+  `file:///srv/public`, which on a case-sensitive file system is a
+  different file. Deny entries want that folding; allow entries would
+  rather not have it. Prefer `deny_tools` / `deny_methods` for resources,
+  or keep to lowercase URIs.
+- **A stalled server is stopped by killing the process mcp-jail
+  started.** A grandchild that still holds the server's stdin open
+  (`npx` starting node) is not, and a write stuck on it can outlive the
+  stop; mcp-jail does not wait for it and exits regardless. One that
+  holds the server's *output* open is waited for, whether the server was
+  killed or left on its own: the pipe cannot be closed under the thread
+  that is reading it, so mcp-jail exits when that grandchild lets go or
+  ends.
+- **Numbers are re-written as an IEEE double would write them.** Integers
+  of any size are exact; a decimal with more significant digits than a
+  double holds (about 17) is rounded to the nearest double, and `1E2`
+  arrives as `100.0`. The jail cannot forward the original digits without
+  forwarding the original bytes.
 
 ## Why not just audit?
 
@@ -352,7 +484,7 @@ is watching. The jail is the enforcement half of the story.
 ## Tests
 
 ```bash
-python3 -m unittest discover -s tests   # 109 tests, fake stdio servers (+ the official MCP SDK when installed)
+python3 -m unittest discover -s tests   # fake stdio servers (+ the official MCP SDK when installed)
 python3 -m pytest -q                    # same suite
 ```
 
