@@ -2149,7 +2149,9 @@ class TestDocs(unittest.TestCase):
         self.assertIn("Dan Calas", lic)
         readme = self.readme()
         self.assertNotIn("TBD", readme)
-        self.assertIn("pip install git+https://github.com/calasdan-sketch/mcp-jail", readme)
+        self.assertIn("pip install mcp-jail", readme)
+        self.assertNotIn("pip install git+", readme)
+        self.assertIn("mcpjail", readme)   # the unrelated PyPI project
         self.assertNotIn("git clone <repo>", readme)
         self.assertNotRegex(readme, r"(?m)^\s*#?\s*(?:or: )?alias ")
         for word in ("strict_args", "audit_args", "0600", "duplicate", "re-serialised",

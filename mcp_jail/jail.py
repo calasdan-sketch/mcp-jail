@@ -72,6 +72,12 @@ _IDLE_WAKE = 0.5
 # is still there is sent SIGTERM (terminate(): TerminateProcess on Windows) and,
 # if it ignores that for _TERM_WAIT seconds, killed.
 DEFAULT_GRACE = 5.0
+#: The longest message (one line, newline included) the jail reads from
+#: either side. A longer one is refused without ever being held in memory.
+DEFAULT_MAX_MESSAGE = 16 * 1024 * 1024
+MIN_MAX_MESSAGE = 1024
+#: The audit log is rotated to audit.jsonl.1 when it grows past this.
+AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024
 _TERM_WAIT = 5.0
 
 
@@ -86,6 +92,16 @@ def seconds_problem(value) -> "str | None":
         return "must be a finite number of seconds"
     if value < 0:
         return "must not be negative"
+    return None
+
+
+def max_message_problem(value) -> "str | None":
+    """Why `value` cannot be --max-message-bytes (None: it can)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"--max-message-bytes {value!r} is not a whole number"
+    if value < MIN_MAX_MESSAGE:
+        return (f"--max-message-bytes {value!r} must be at least "
+                f"{MIN_MAX_MESSAGE}")
     return None
 
 
@@ -389,7 +405,7 @@ def _compile_rule_set(spec, where: str = "arg_rules",
 POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
                "deny_methods", "strict_args", "audit_args", "hide_denied")
 # Notes: written by --init-policy and by `learn`, never read.
-NOTE_KEYS = ("_comment", "_not_called")
+NOTE_KEYS = ("_comment", "_examples", "_not_called")
 RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
 # compile_policy() marks the dict it has compiled with these; a policy
 # file must not be able to carry them (a forged marker skips validation).
@@ -608,9 +624,38 @@ def load_policy(path: str) -> dict:
     return compile_policy(pol)
 
 
+_PERMISSIVE_WARNING = (
+    "mcp-jail: warning: this policy allows every tool and blocks nothing "
+    "(it is still the starter policy). `mcp-jail learn -- <server command>` writes "
+    "a tight allowlist from a real session; see the README.")
+
+
+_STARTER_MARK = "mcp-jail STARTER policy"
+
+
+def _is_unedited_starter(pol: dict) -> bool:
+    """The policy --init-policy wrote, still blocking nothing: its own note
+    is there and no tool, argument or method is restricted."""
+    note = pol.get("_comment")
+    return (isinstance(note, str) and note.startswith(_STARTER_MARK)
+            and _blocks_nothing(pol))
+
+
+def _blocks_nothing(pol: dict) -> bool:
+    """True for a policy that lets every call through: every tool allowed
+    (`allow_tools` absent or holding `*`), nothing denied, no argument rules
+    and no refused method."""
+    allow = pol.get("allow_tools")
+    return ((allow is None or "*" in allow) and not pol.get("deny_tools")
+            and not pol.get("arg_rules") and not pol.get("deny_methods"))
+
+
 def default_policy() -> dict:
     return {
-        "_comment": "mcp-jail policy. Unknown keys are refused at startup. "
+        "_comment": _STARTER_MARK + ": it allows every tool and blocks "
+                    "nothing - tighten it before you rely on it (see "
+                    "_examples, which is never read, and `mcp-jail learn`). "
+                    "Unknown keys are refused at startup. "
                     "allow_tools/deny_tools are tool names "
                     "('*' = all; deny wins; names are compared normalised: "
                     "NFKC, case-folded, trimmed, invisible characters "
@@ -628,6 +673,17 @@ def default_policy() -> dict:
                     "see them. Only tools/call (plus policed_methods, e.g. "
                     "prompts/get, resources/read) is checked; deny_methods "
                     "refuses whole JSON-RPC methods ('resources/*').",
+        "_examples": {
+            "only the tools you use (then run `mcp-jail learn`)": {
+                "allow_tools": ["read_file", "list_directory"],
+                "strict_args": True},
+            "block named tools": {"deny_tools": ["run_command",
+                                                 "delete_file"]},
+            "limit a tool's arguments": {"arg_rules": {"read_file": {
+                "allow": {"path": ["^/home/me/project/"]},
+                "deny": {"**.path": ["\\.\\."]}}}},
+            "refuse a family of methods": {"deny_methods": ["resources/*"]},
+        },
         "allow_tools": ["*"],
         "deny_tools": [],
         "arg_rules": {},
@@ -898,6 +954,41 @@ def _open_private_append(path: str):
     return os.fdopen(fd, "a", encoding="utf-8")
 
 
+def audit_log_limit() -> "int | None":
+    """Bytes at which the audit log is rotated: MCP_JAIL_AUDIT_MAX_MB
+    (megabytes, fractions allowed; 0 = never) or AUDIT_LOG_MAX_BYTES. A value
+    that is not a finite number >= 0 is ignored."""
+    raw = os.environ.get("MCP_JAIL_AUDIT_MAX_MB")
+    if raw and raw.strip():
+        try:
+            megabytes = float(raw)
+        except ValueError:
+            megabytes = None
+        if megabytes is not None and 0 <= megabytes < float("inf"):
+            try:
+                return int(megabytes * 1024 * 1024) or None
+            except OverflowError:
+                return None
+    return AUDIT_LOG_MAX_BYTES
+
+
+def _rotate_audit_log(path: str) -> None:
+    """Keep the log from growing for ever: past the limit the file becomes
+    `<log>.1` (replacing the one before it) and a new log starts. So the
+    two files together hold at most about twice the limit. Best effort - a
+    log that cannot be moved (open in another process on Windows) just keeps
+    growing until it can."""
+    limit = audit_log_limit()
+    if limit is None:
+        return
+    try:
+        if os.path.getsize(path) <= limit:
+            return
+        os.replace(path, path + ".1")
+    except OSError:
+        pass
+
+
 def audit(event: dict) -> None:
     """Append one JSON line to the audit log. An unwritable log is
     reported on stderr but never takes the firewall down: the decision
@@ -906,6 +997,7 @@ def audit(event: dict) -> None:
     event["at"] = int(time.time())
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        _rotate_audit_log(path)
         with _open_private_append(path) as f:
             f.write(json.dumps(event) + "\n")
     except OSError as e:
@@ -1016,24 +1108,35 @@ class _FdLineReader:
     def __init__(self, fd: int):
         self._fd = fd
         self._buf = bytearray()
+        self._scanned = 0       # bytes of _buf already known to hold no "\n"
         self._eof = False
 
-    def readline(self) -> bytes:
+    def readline(self, limit: int = -1) -> bytes:
+        """The next line, newline included; at most `limit` bytes of it when
+        `limit` is not negative (the rest comes with the next call, as
+        BufferedReader.readline does). The buffer is searched from where the
+        last search ended, so a line of any length costs time linear in it,
+        and it never holds more than `limit` plus one read."""
         while True:
-            i = self._buf.find(b"\n")
-            if i >= 0:
-                line = bytes(self._buf[:i + 1])
-                del self._buf[:i + 1]
-                return line
+            i = self._buf.find(b"\n", self._scanned)
+            if i >= 0 and (limit < 0 or i + 1 <= limit):
+                return self._take(i + 1)
+            if limit >= 0 and len(self._buf) >= limit:
+                return self._take(limit)
             if self._eof:
-                line = bytes(self._buf)
-                self._buf.clear()
-                return line
+                return self._take(len(self._buf))
+            self._scanned = len(self._buf)
             chunk = os.read(self._fd, 65536)
             if not chunk:
                 self._eof = True
             else:
                 self._buf += chunk
+
+    def _take(self, n: int) -> bytes:
+        line = bytes(self._buf[:n])
+        del self._buf[:n]
+        self._scanned = 0
+        return line
 
 
 def _binary_in(stream):
@@ -1219,20 +1322,57 @@ class _ServerInput:
             self._notify(failure)
 
 
+class _Oversize:
+    """What a reader queues in place of a line longer than its limit: how
+    long the line was, and its first bytes (to recover an id from)."""
+
+    def __init__(self, size: int, head: bytes):
+        self.size, self.head = size, head
+
+
+_HEAD_BYTES = 4096
+_DISCARD_CHUNK = 65536
+_HEAD_ID_RE = re.compile(
+    rb'\A\s*\{\s*(?:"jsonrpc"\s*:\s*"2\.0"\s*,\s*)?"id"\s*:\s*'
+    rb'(-?[0-9]{1,18}|"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt]){0,200}")\s*,')
+
+
+def _head_id(head: bytes):
+    """The id at the very start of the first bytes of a message that was too
+    long to read (`{"jsonrpc":"2.0","id":7,...`), or _NO_ID. Only the
+    canonical position is trusted: an id further in could belong to anything."""
+    m = _HEAD_ID_RE.match(head)
+    if not m:
+        return _NO_ID
+    try:
+        rid = json.loads(m.group(1))
+    except ValueError:
+        return _NO_ID
+    return rid if isinstance(rid, (str, int)) and not isinstance(rid, bool) \
+        else _NO_ID
+
+
 class _Reader(threading.Thread):
     """Pump lines from a binary stream into a queue as (tag, line);
-    (tag, None) marks EOF or a broken pipe."""
+    (tag, None) marks EOF or a broken pipe. A line over `max_bytes` is never
+    held: the first bytes of it are kept, the rest is read and thrown away
+    in pieces, and (tag, _Oversize) is queued instead."""
 
-    def __init__(self, stream, tag: str, q: "queue.Queue"):
+    def __init__(self, stream, tag: str, q: "queue.Queue",
+                 max_bytes: int = DEFAULT_MAX_MESSAGE):
         super().__init__(name=f"mcp-jail-{tag}-reader", daemon=True)
         self._stream, self._tag, self._q = stream, tag, q
+        self._max = max_bytes
 
     def run(self) -> None:
         try:
             while True:
-                line = self._stream.readline()
+                line = self._stream.readline(self._max + 1)
                 if not line:
                     break
+                if len(line) > self._max:
+                    self._q.put((self._tag, self._discard_rest(line)))
+                    continue
                 # Frames are newline-delimited; a Windows text-mode peer
                 # ends them with CRLF. Normalise the terminator only --
                 # the JSON bytes themselves are never touched.
@@ -1241,6 +1381,15 @@ class _Reader(threading.Thread):
             pass
         finally:
             self._q.put((self._tag, None))
+
+    def _discard_rest(self, first: bytes) -> _Oversize:
+        size, last = len(first), first
+        while not last.endswith(b"\n"):
+            last = self._stream.readline(_DISCARD_CHUNK)
+            if not last:
+                break
+            size += len(last)
+        return _Oversize(size, first[:_HEAD_BYTES])
 
 
 class ServerNotFound(Exception):
@@ -1634,9 +1783,11 @@ class _Proxy:
 
     def __init__(self, proc, client_in, client_out, timeout: float | None,
                  pol: dict | None, observer=None, grace: float = DEFAULT_GRACE,
-                 stop: "_StopSignals | None" = None):
+                 stop: "_StopSignals | None" = None,
+                 max_message: int = DEFAULT_MAX_MESSAGE):
         self.proc = proc
         self.grace = grace
+        self.max_message = max_message
         self.q: "queue.SimpleQueue" = queue.SimpleQueue()
         self.client = _Writer(client_out)
         self.timeout = timeout if timeout and timeout > 0 else None
@@ -1725,6 +1876,16 @@ class _Proxy:
             prefix = "Parse error" if code == PARSE_ERROR else "Invalid Request"
             self.client.send(_rpc_error(req_id, code, f"{prefix}: {why}"))
         self._audit_rejected("client", why, subject, method)
+
+    def _on_client_oversize(self, big: "_Oversize") -> None:
+        """A client line past --max-message-bytes: it was not read (and is not
+        held); the client is told, under its id when the first bytes show
+        one, and it is on the audit record."""
+        rid = _head_id(big.head)
+        self._refuse(f"message too large ({big.size} bytes; the limit is "
+                     f"{self.max_message}, see --max-message-bytes)",
+                     req_id=None if rid is _NO_ID else rid,
+                     subject=big.head)
 
     def _on_client_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
@@ -1874,6 +2035,14 @@ class _Proxy:
         else:
             self._log(f"dropping a message from the server: {why}")
         self._audit_rejected("server", why, subject)
+
+    def _on_server_oversize(self, big: "_Oversize") -> None:
+        """A server line past --max-message-bytes: dropped unread. The request
+        it answers (its id, when the first bytes show it) fails with -32603;
+        otherwise that request waits for --timeout."""
+        self._refuse_server(f"response too large ({big.size} bytes; the limit "
+                            f"is {self.max_message}, see --max-message-bytes)",
+                            _head_id(big.head), big.head)
 
     def _on_server_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
@@ -2101,8 +2270,8 @@ class _Proxy:
         closed its pipes while the client was still talking to it, stopped
         reading its input, or left a request unanswered past --timeout, and
         128 plus the number of the signal that stopped it."""
-        _Reader(self._client_in, "client", self.q).start()
-        _Reader(self.proc.stdout, "server", self.q).start()
+        _Reader(self._client_in, "client", self.q, self.max_message).start()
+        _Reader(self.proc.stdout, "server", self.q, self.max_message).start()
         self.server.start()
         client_open = True
         try:
@@ -2125,7 +2294,8 @@ class _Proxy:
                     if line is None:
                         client_open = False
                         continue
-                    self._handle(self._on_client_line, line)
+                    self._handle(self._on_client_line if isinstance(
+                        line, bytes) else self._on_client_oversize, line)
                 elif tag == "input":
                     if line is not None:    # writing failed: its stdin is gone
                         self._lose(f"closed its input ({line})", "server closed")
@@ -2143,7 +2313,8 @@ class _Proxy:
                         self._lose("exited or closed its output"
                                    + self._server_status(), "server closed")
                         break
-                    self._handle(self._on_server_line, line)
+                    self._handle(self._on_server_line if isinstance(
+                        line, bytes) else self._on_server_oversize, line)
         except (BrokenPipeError, KeyboardInterrupt):
             pass
         except (OSError, ValueError) as e:  # a pipe went away under us
@@ -2162,7 +2333,8 @@ class _Proxy:
 
 
 def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
-        stdin=None, stdout=None, grace: float = DEFAULT_GRACE) -> int:
+        stdin=None, stdout=None, grace: float = DEFAULT_GRACE,
+        max_message: int = DEFAULT_MAX_MESSAGE) -> int:
     """Run the jail: policy-check stdin -> server, pass server -> stdout.
 
     `stdin`/`stdout` default to the process's own (binary) streams; tests
@@ -2170,6 +2342,8 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     on its own once the client has gone (0: not at all).
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
+    if problem is None:
+        problem = max_message_problem(max_message)
     if problem:
         _say(f"mcp-jail: {problem}")
         return 2
@@ -2201,8 +2375,11 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
             _say(f"mcp-jail: {_server_problem(e)}")
             return 2
         try:
+            if _is_unedited_starter(pol):
+                _say(_PERMISSIVE_WARNING)
             return _Proxy(proc, client_in, client_out, timeout, pol,
-                          grace=grace, stop=stop).serve()
+                          grace=grace, stop=stop,
+                          max_message=max_message).serve()
         finally:
             _stop(proc)
 
@@ -2461,6 +2638,10 @@ class _Session:
             if line is None:
                 self.closed = True
                 return ("closed",)
+            if isinstance(line, _Oversize):
+                _say(f"learn: ignoring a line of {line.size} bytes from the "
+                     f"server (the limit is {DEFAULT_MAX_MESSAGE})")
+                continue
             obj, code, _err = _parse(line)
             if code is not None:
                 _say(f"learn: ignoring non-JSON line from server: "

@@ -37,9 +37,17 @@ not start (a script with no `#!` line).
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/mcp-jail
+pip install mcp-jail
 mcp-jail --version
 ```
+
+(From source: `git clone https://github.com/calasdan-sketch/mcp-jail && pip
+install ./mcp-jail`.) Not to be confused with `mcpjail`, a different,
+unrelated project on PyPI: this one is **`mcp-jail`**, with a hyphen, and
+installs the `mcp-jail` command. Run that command, not
+`python -m mcp_jail`: `-m` imports an `mcp_jail/` package from the current
+directory first, which in a repository you have just cloned is that
+repository's code.
 
 ## Usage
 
@@ -59,7 +67,16 @@ mcp-jail --help                              # every flag, explained
 (`%USERPROFILE%\.mcp-jail\policy.json` on Windows), creating the
 directory; `--path FILE` writes it there instead. It refuses to replace a
 file that is already there (one line on stderr, exit `2`) unless you add
-`--force`.
+`--force`. A path it cannot write (a read-only folder, a directory, no
+permission) is the same one line and exit `2`, not a traceback.
+
+**The starter policy allows every tool and blocks nothing**, and
+`--init-policy` says so when it writes it (stderr), as `mcp-jail` does each
+time it starts with a copy of it that you have not tightened. It is a place to
+begin: run `mcp-jail learn -- <server command>` to write a tight allowlist from
+a real session, or edit the file; its `_examples` entry (a note, never read)
+holds stricter policies to copy from - only the tools you use, named tools
+blocked, a path limit on `read_file`, a refused method family.
 
 Policy (`policy.json`):
 
@@ -162,6 +179,21 @@ calls** — the arguments of allowed calls are routinely tokens, file
 contents and prompts, and a log of them is a second copy of your
 secrets. Logged string values are cut to 200 characters. `audit_args: "all"` turns full
 logging on if you want it.
+
+The log does not grow for ever: when `audit.jsonl` passes 10 MiB it is
+renamed to `audit.jsonl.1` (replacing the one before) and a new file starts,
+so the two hold at most about 20 MiB. `MCP_JAIL_AUDIT_MAX_MB` changes the
+limit (fractions allowed; `0` never rotates). `--audit` reads the current file
+only; the older records are in `audit.jsonl.1`.
+
+`--max-message-bytes N` (default 16777216, 16 MiB; at least 1024): the
+longest message - one line, newline included - the jail reads from the client
+or from the server. A longer client message is refused with `-32600` (under
+its id when the first bytes show one) and a longer server response fails the
+request it answers with `-32603`; both are on the audit record
+(`rejected`). The rest of the line is read and thrown away in pieces: it is
+never held in memory, so a 400 MB line costs neither the memory nor the time
+it did.
 
 `--timeout N` (default 30; `0` waits for ever): seconds to wait for each
 server response before the jail fails closed with a JSON-RPC timeout
@@ -531,6 +563,13 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
 What mcp-jail does not do, in plain words (the two caveats on deny
 patterns and on `learn` above apply as well):
 
+- **Tool names in `allow_tools` are folded too.** The case-folding and NFKC
+  normalisation that make `Delete_All` match a deny entry for `delete_all`
+  apply to allow entries as well: allowing `read_file` also allows a tool
+  the server calls `READ_FILE` or `read_file` with a zero-width space in it,
+  and two tools whose names differ only that way are one tool to the policy.
+  If a server really has such look-alike tools, deny the one you do not want
+  by its normalised name.
 - **A URI in `allow_tools` is compared like a tool name**: NFKC-normalised
   and case-folded. A policy that allows `file:///srv/Public` also allows
   `file:///srv/public`, which on a case-sensitive file system is a

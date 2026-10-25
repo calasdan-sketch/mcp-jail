@@ -116,16 +116,39 @@ def _positive_count(text: str) -> int:
     return value
 
 
+def _message_bytes(text: str) -> int:
+    """argparse type for --max-message-bytes: a whole number, 1024 or more."""
+    try:
+        value = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a whole number") from None
+    why = jail_mod.max_message_problem(value)
+    if why is not None:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is below the minimum of {jail_mod.MIN_MAX_MESSAGE}")
+    return value
+
+
 def cmd_init_policy(args) -> int:
-    path = jail_mod.expand_path(args.path)
-    if os.path.exists(path) and not args.force:
-        jail_mod._say(f"exists: {path} (use --force to overwrite)")
+    try:
+        path = jail_mod.expand_path(args.path)
+        if os.path.exists(path) and not args.force:
+            jail_mod._say(f"exists: {path} (use --force to overwrite)")
+            return 2
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(jail_mod.default_policy(), f, indent=2)
+            f.write("\n")
+    except (OSError, ValueError) as e:     # unwritable, a directory, a NUL ...
+        why = getattr(e, "strerror", None) or str(e)
+        jail_mod._say(f"mcp-jail: cannot write the policy {args.path}: {why}")
         return 2
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(jail_mod.default_policy(), f, indent=2)
-        f.write("\n")
     print(f"wrote {path}")
+    jail_mod._say("mcp-jail: warning: this starter policy allows EVERY tool "
+                  "and blocks nothing. Run `mcp-jail learn -- <server "
+                  "command>` to write a tight one from a real session, or "
+                  "edit it (see _examples in the file).")
     return 0
 
 
@@ -253,6 +276,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "request is answered; then it is sent SIGTERM, and "
                         "killed if it ignores that (default: 5; 0 stops it "
                         "at once)")
+    p.add_argument("--max-message-bytes", type=_message_bytes,
+                   default=jail_mod.DEFAULT_MAX_MESSAGE, metavar="N",
+                   help="the longest message, one line, accepted from the "
+                        "client or the server (default: 16777216, 16 MiB; "
+                        "at least 1024). A longer client message is refused "
+                        "with -32600, a longer server response with -32603 "
+                        "and an audit record; neither is held in memory")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
                         "mcp-jail --policy p.json -- npx -y srv")
@@ -275,7 +305,7 @@ def _main(argv: list[str]) -> int:
                       "mcp-jail --policy p.json -- <cmd>")
         return 2
     return jail_mod.run(args.policy, cmd, timeout=args.timeout,
-                        grace=args.grace)
+                        grace=args.grace, max_message=args.max_message_bytes)
 
 
 def main(argv=None) -> int:
