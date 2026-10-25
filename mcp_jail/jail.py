@@ -25,6 +25,7 @@ import contextlib
 import difflib
 import fnmatch
 import heapq
+import importlib
 import io
 import itertools
 import json
@@ -76,6 +77,10 @@ DEFAULT_GRACE = 5.0
 #: either side. A longer one is refused without ever being held in memory.
 DEFAULT_MAX_MESSAGE = 16 * 1024 * 1024
 MIN_MAX_MESSAGE = 1024
+#: --max-message-bytes above this is refused: past what a read call can take
+#: (a larger number died in OverflowError), and 1 TiB is not a limit anyone
+#: needs.
+MAX_MAX_MESSAGE = 2 ** 40
 #: The audit log is rotated to audit.jsonl.1 when it grows past this.
 AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024
 _TERM_WAIT = 5.0
@@ -102,6 +107,9 @@ def max_message_problem(value) -> "str | None":
     if value < MIN_MAX_MESSAGE:
         return (f"--max-message-bytes {value!r} must be at least "
                 f"{MIN_MAX_MESSAGE}")
+    if value > MAX_MAX_MESSAGE:
+        return (f"--max-message-bytes {value!r} must be at most "
+                f"{MAX_MAX_MESSAGE} (1 TiB)")
     return None
 
 
@@ -644,10 +652,12 @@ def _is_unedited_starter(pol: dict) -> bool:
 def _blocks_nothing(pol: dict) -> bool:
     """True for a policy that lets every call through: every tool allowed
     (`allow_tools` absent or holding `*`), nothing denied, no argument rules
-    and no refused method."""
+    and no refused method. strict_args blocks: a tool without allow patterns
+    then accepts only empty arguments."""
     allow = pol.get("allow_tools")
     return ((allow is None or "*" in allow) and not pol.get("deny_tools")
-            and not pol.get("arg_rules") and not pol.get("deny_methods"))
+            and not pol.get("arg_rules") and not pol.get("deny_methods")
+            and not pol.get("strict_args"))
 
 
 def default_policy() -> dict:
@@ -972,21 +982,90 @@ def audit_log_limit() -> "int | None":
     return AUDIT_LOG_MAX_BYTES
 
 
+_rotate_lock = threading.Lock()
+_LOCK_WAIT = 2.0
+
+
+@contextlib.contextmanager
+def _exclusive(lock_path: str):
+    """Hold an exclusive lock on `lock_path` (a file next to the log, made
+    0600) among every mcp-jail on this machine, and say whether it was got:
+    `with _exclusive(p) as got:`. It waits at most _LOCK_WAIT seconds and
+    never raises - a jail whose log cannot be locked must still run."""
+    got = False
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT
+                     | getattr(os, "O_BINARY", 0), 0o600)
+        deadline = time.monotonic() + _LOCK_WAIT
+        while True:
+            try:
+                if _WINDOWS:
+                    msvcrt = importlib.import_module("msvcrt")
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl = importlib.import_module("fcntl")  # POSIX only
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.005)
+    except (OSError, ImportError):
+        pass
+    try:
+        yield got
+    finally:
+        if fd is not None:
+            if got:
+                try:
+                    if _WINDOWS:
+                        msvcrt = importlib.import_module("msvcrt")
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl = importlib.import_module("fcntl")
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
 def _rotate_audit_log(path: str) -> None:
     """Keep the log from growing for ever: past the limit the file becomes
     `<log>.1` (replacing the one before it) and a new log starts. So the
     two files together hold at most about twice the limit. Best effort - a
     log that cannot be moved (open in another process on Windows) just keeps
-    growing until it can."""
+    growing until it can.
+
+    Several jails share one log (one per configured server). Two of them can
+    see the log over the limit at the same moment; the second one's rename
+    then moved the NEW log - a few lines long - over `<log>.1` and the whole
+    history was gone. The size is checked again, and the file moved, while
+    holding a lock (`<log>.lock`) that every jail takes, so only the first
+    one rotates and the rest find a small log and leave it alone. If the
+    lock cannot be got in a couple of seconds the log is simply not rotated
+    this time."""
     limit = audit_log_limit()
     if limit is None:
         return
     try:
         if os.path.getsize(path) <= limit:
-            return
-        os.replace(path, path + ".1")
+            return          # the usual case: no lock taken
     except OSError:
-        pass
+        return
+    with _rotate_lock, _exclusive(path + ".lock") as got:
+        if not got:
+            return
+        try:
+            if os.path.getsize(path) <= limit:
+                return      # another jail rotated while this one waited
+            os.replace(path, path + ".1")
+        except OSError:
+            pass
 
 
 def audit(event: dict) -> None:
@@ -1324,13 +1403,14 @@ class _ServerInput:
 
 class _Oversize:
     """What a reader queues in place of a line longer than its limit: how
-    long the line was, and its first bytes (to recover an id from)."""
+    long the line was, its first bytes and its last (to recover an id from)."""
 
-    def __init__(self, size: int, head: bytes):
-        self.size, self.head = size, head
+    def __init__(self, size: int, head: bytes, tail: bytes = b""):
+        self.size, self.head, self.tail = size, head, tail
 
 
 _HEAD_BYTES = 4096
+_TAIL_BYTES = 4096
 _DISCARD_CHUNK = 65536
 _HEAD_ID_RE = re.compile(
     rb'\A\s*\{\s*(?:"jsonrpc"\s*:\s*"2\.0"\s*,\s*)?"id"\s*:\s*'
@@ -1350,6 +1430,35 @@ def _head_id(head: bytes):
         return _NO_ID
     return rid if isinstance(rid, (str, int)) and not isinstance(rid, bool) \
         else _NO_ID
+
+
+_TAIL_ID_RE = re.compile(
+    rb',\s*"id"\s*:\s*'
+    rb'(-?[0-9]{1,18}|"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt]){0,200}")\s*\}\s*\Z')
+
+
+def _tail_id(tail: bytes):
+    """The id at the very end of a message that was too long to read
+    (`{"jsonrpc":"2.0","result":{...},"id":7}`), or _NO_ID. Only an id that is
+    followed by nothing but the closing brace of the message counts: one
+    inside a nested object is followed by more braces, and one inside a string
+    has its quotes escaped."""
+    m = _TAIL_ID_RE.search(tail)
+    if not m:
+        return _NO_ID
+    try:
+        rid = json.loads(m.group(1))
+    except ValueError:
+        return _NO_ID
+    return rid if isinstance(rid, (str, int)) and not isinstance(rid, bool) \
+        else _NO_ID
+
+
+def oversize_id(big: "_Oversize"):
+    """The id of the message `big` stands for: from its start when it is there,
+    else from its end. _NO_ID when neither shows one."""
+    rid = _head_id(big.head)
+    return rid if rid is not _NO_ID else _tail_id(big.tail)
 
 
 class _Reader(threading.Thread):
@@ -1384,12 +1493,14 @@ class _Reader(threading.Thread):
 
     def _discard_rest(self, first: bytes) -> _Oversize:
         size, last = len(first), first
+        tail = first[-_TAIL_BYTES:]
         while not last.endswith(b"\n"):
             last = self._stream.readline(_DISCARD_CHUNK)
             if not last:
                 break
             size += len(last)
-        return _Oversize(size, first[:_HEAD_BYTES])
+            tail = (tail + last[-_TAIL_BYTES:])[-_TAIL_BYTES:]
+        return _Oversize(size, first[:_HEAD_BYTES], tail)
 
 
 class ServerNotFound(Exception):
@@ -1879,9 +1990,9 @@ class _Proxy:
 
     def _on_client_oversize(self, big: "_Oversize") -> None:
         """A client line past --max-message-bytes: it was not read (and is not
-        held); the client is told, under its id when the first bytes show
-        one, and it is on the audit record."""
-        rid = _head_id(big.head)
+        held); the client is told, under its id when the first or the last
+        bytes show one, and it is on the audit record."""
+        rid = oversize_id(big)
         self._refuse(f"message too large ({big.size} bytes; the limit is "
                      f"{self.max_message}, see --max-message-bytes)",
                      req_id=None if rid is _NO_ID else rid,
@@ -2042,7 +2153,7 @@ class _Proxy:
         otherwise that request waits for --timeout."""
         self._refuse_server(f"response too large ({big.size} bytes; the limit "
                             f"is {self.max_message}, see --max-message-bytes)",
-                            _head_id(big.head), big.head)
+                            oversize_id(big), big.head)
 
     def _on_server_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
@@ -2588,15 +2699,16 @@ class _Session:
     -32601 error so the server never waits on a client that isn't there.
     """
 
-    def __init__(self, proc):
+    def __init__(self, proc, max_message: int = DEFAULT_MAX_MESSAGE):
         self.proc = proc
+        self.max_message = max_message
         self.q: "queue.Queue" = queue.Queue()
         # no stall timer of its own: request() waits with its own deadline
         self.out = _ServerInput(proc.stdin, None,
                                 lambda payload: self.q.put(("input", payload)))
         self.out.start()
         self.closed = False
-        _Reader(proc.stdout, "server", self.q).start()
+        _Reader(proc.stdout, "server", self.q, max_message).start()
 
     def notify(self, msg: dict) -> bool:
         """Send a notification (or any message) without waiting. False
@@ -2640,7 +2752,8 @@ class _Session:
                 return ("closed",)
             if isinstance(line, _Oversize):
                 _say(f"learn: ignoring a line of {line.size} bytes from the "
-                     f"server (the limit is {DEFAULT_MAX_MESSAGE})")
+                     f"server (the limit is {self.max_message}, see "
+                     f"--max-message-bytes)")
                 continue
             obj, code, _err = _parse(line)
             if code is not None:
@@ -2683,12 +2796,13 @@ def load_script(path: str) -> list[dict]:
 
 
 def _learn_from_script(proc, calls: list[dict], timeout: float,
-                       rec: _Recorder) -> str | None:
+                       rec: _Recorder,
+                       max_message: int = DEFAULT_MAX_MESSAGE) -> str | None:
     """Drive canned calls against the server; no client needed. A call
     is recorded only once the server answered it successfully. Returns
     None when the script ran through, else why the session ended early
     (the server refused initialize, or went away)."""
-    session = _Session(proc)
+    session = _Session(proc, max_message)
     try:
         return _drive_script(session, calls, timeout, rec)
     finally:
@@ -2756,7 +2870,8 @@ def _drive_script(session: _Session, calls: list[dict], timeout: float,
 
 def learn(server_cmd: list[str], script: str | None = None,
           out: str | None = None, timeout: float = 30.0,
-          stdin=None, stdout=None, grace: float = DEFAULT_GRACE) -> int:
+          stdin=None, stdout=None, grace: float = DEFAULT_GRACE,
+          max_message: int = DEFAULT_MAX_MESSAGE) -> int:
     """Observe a server and emit a tight-fit allowlist policy.
 
     --script mode drives canned calls against the server (no client).
@@ -2770,6 +2885,8 @@ def learn(server_cmd: list[str], script: str | None = None,
     for review instead, so a failed run never overwrites a good policy.
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
+    if problem is None:
+        problem = max_message_problem(max_message)
     if problem:
         _say(f"mcp-jail learn: {problem}")
         return 2
@@ -2818,10 +2935,12 @@ def learn(server_cmd: list[str], script: str | None = None,
         failure: str | None = None
         try:
             if script is not None:
-                failure = _learn_from_script(proc, calls, timeout, rec)
+                failure = _learn_from_script(proc, calls, timeout, rec,
+                                             max_message)
             else:
                 proxy = _Proxy(proc, client_in, client_out, timeout, None,
-                               observer=rec, grace=grace, stop=stop)
+                               observer=rec, grace=grace, stop=stop,
+                               max_message=max_message)
                 try:
                     proxy.serve()
                 except KeyboardInterrupt:

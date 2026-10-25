@@ -117,7 +117,7 @@ def _positive_count(text: str) -> int:
 
 
 def _message_bytes(text: str) -> int:
-    """argparse type for --max-message-bytes: a whole number, 1024 or more."""
+    """argparse type for --max-message-bytes: a whole number, 1024 to 2**40."""
     try:
         value = int(text)
     except ValueError:
@@ -125,6 +125,10 @@ def _message_bytes(text: str) -> int:
             f"{text!r} is not a whole number") from None
     why = jail_mod.max_message_problem(value)
     if why is not None:
+        if value > jail_mod.MAX_MAX_MESSAGE:
+            raise argparse.ArgumentTypeError(
+                f"{text!r} is above the maximum of {jail_mod.MAX_MAX_MESSAGE} "
+                f"(1 TiB)")
         raise argparse.ArgumentTypeError(
             f"{text!r} is below the minimum of {jail_mod.MIN_MAX_MESSAGE}")
     return value
@@ -220,6 +224,12 @@ def cmd_learn(argv: list[str]) -> int:
                    help="live mode: seconds to give the server to exit on "
                         "its own once stdin has ended, before it is sent "
                         "SIGTERM (default: 5; 0 stops it at once)")
+    p.add_argument("--max-message-bytes", type=_message_bytes,
+                   default=jail_mod.DEFAULT_MAX_MESSAGE, metavar="N",
+                   help="the longest message, one line, accepted from the "
+                        "client or the server (default: 16777216, 16 MiB; "
+                        "1024 to 1099511627776). A longer server message "
+                        "is skipped")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
                         "mcp-jail learn --script c.json -- <cmd>")
@@ -233,7 +243,8 @@ def cmd_learn(argv: list[str]) -> int:
                       "-- <cmd>")
         return 2
     return jail_mod.learn(cmd, script=args.script, out=args.out,
-                          timeout=args.timeout, grace=args.grace)
+                          timeout=args.timeout, grace=args.grace,
+                          max_message=args.max_message_bytes)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -280,7 +291,8 @@ def build_parser() -> argparse.ArgumentParser:
                    default=jail_mod.DEFAULT_MAX_MESSAGE, metavar="N",
                    help="the longest message, one line, accepted from the "
                         "client or the server (default: 16777216, 16 MiB; "
-                        "at least 1024). A longer client message is refused "
+                        "1024 to 1099511627776). A longer client message is "
+                        "refused "
                         "with -32600, a longer server response with -32603 "
                         "and an audit record; neither is held in memory")
     p.add_argument("server", nargs=argparse.REMAINDER,

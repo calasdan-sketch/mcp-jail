@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.6.4
+
+- **Fixed: every release failed.** The release workflow's version check was a
+  YAML plain value that folds into one line, so the script never ran. It is a
+  block (`run: |`) now, and a test reads the workflow, runs the checks with a
+  faked tag and commit, and fails if a `run:` ever folds again. The workflow
+  also refuses a tag whose commit is not on `main` and runs the tests from the
+  built sdist; CI does the same on every change and also runs Python 3.14.
+- **Fixed: several jails could erase the audit history.** Jails that share
+  `~/.mcp-jail/audit.jsonl` could all see the log over its limit; the second
+  rename then moved the new, nearly empty log over `audit.jsonl.1`. The size is
+  now checked again, and the file moved, under a lock (`audit.jsonl.lock`).
+- **Fixed: an oversize server response could leave its request waiting.** The
+  `id` was only looked for at the start of the message. The last 4 KB are kept
+  too, so `{"result":...,"id":7}` fails request 7 at once. An `id` inside a
+  nested object or a string is still not trusted.
+- `--max-message-bytes` above 2^40 (1 TiB) is refused; larger numbers used to
+  end in an `OverflowError` traceback and a dead session.
+- The starter-policy warning ("allows every tool and blocks nothing") is no
+  longer shown for a policy with `strict_args` on, which does block.
+- `mcp-jail learn` takes `--max-message-bytes` and uses it (it was fixed at the
+  default).
+
 ## 0.6.3
 
 - **Memory and time:** a message from the client or the server is read in

@@ -241,12 +241,12 @@ class TestTheProxyEnforcesTheLimit(Base):
         for r in replies:
             self.assertLess(len(json.dumps(r)), 1000)
 
-    def test_a_response_whose_id_is_not_at_the_start_times_out_instead(self):
+    def test_a_response_whose_id_is_last_is_failed_by_its_id(self):
         code, replies, err = self.drive([request(5, "bigtail")], self.LIMIT,
-                                        timeout=1.0)
-        self.assertEqual(code, jail_mod.EXIT_SERVER)
+                                        timeout=30.0)
+        self.assertEqual(code, 0)       # answered by its id, not timed out
         by_id = {r["id"]: r for r in replies}
-        self.assertIn("error", by_id[5])
+        self.assertIn("too large", by_id[5]["error"]["message"])
 
     def test_the_default_is_sixteen_mebibytes(self):
         self.assertEqual(jail_mod.DEFAULT_MAX_MESSAGE, 16 * 1024 * 1024)

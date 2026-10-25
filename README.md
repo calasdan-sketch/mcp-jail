@@ -184,14 +184,20 @@ The log does not grow for ever: when `audit.jsonl` passes 10 MiB it is
 renamed to `audit.jsonl.1` (replacing the one before) and a new file starts,
 so the two hold at most about 20 MiB. `MCP_JAIL_AUDIT_MAX_MB` changes the
 limit (fractions allowed; `0` never rotates). `--audit` reads the current file
-only; the older records are in `audit.jsonl.1`.
+only; the older records are in `audit.jsonl.1`. Several jails (one per
+configured server) share the one log: the check and the rename are done under
+a lock (`audit.jsonl.lock`, next to the log), so only one of them rotates and
+the history is never replaced by a nearly empty file. If the lock cannot be
+had within two seconds the log is not rotated that time.
 
-`--max-message-bytes N` (default 16777216, 16 MiB; at least 1024): the
+`--max-message-bytes N` (default 16777216, 16 MiB; from 1024 to 2^40): the
 longest message - one line, newline included - the jail reads from the client
 or from the server. A longer client message is refused with `-32600` (under
-its id when the first bytes show one) and a longer server response fails the
-request it answers with `-32603`; both are on the audit record
-(`rejected`). The rest of the line is read and thrown away in pieces: it is
+its id when the first or the last bytes show one) and a longer server response
+fails the request it answers with `-32603` - at once, whether its `id` comes
+first (`{"jsonrpc":"2.0","id":7,...`) or last (`...,"id":7}`); an `id` anywhere
+else is not trusted and that request waits for `--timeout`. Both are on the
+audit record (`rejected`). `mcp-jail learn` takes the same option. The rest of the line is read and thrown away in pieces: it is
 never held in memory, so a 400 MB line costs neither the memory nor the time
 it did.
 
