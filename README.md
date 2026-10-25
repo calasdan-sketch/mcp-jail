@@ -256,12 +256,96 @@ override in a reason or a tool name (the client chooses it) is shown as
 an escape (`\n`, `\x1b`, `\u202e`), so it cannot forge a line of the
 report or drive your terminal.
 
+## Lockfile: catch a rug pull
+
+A policy limits what a tool may be *called with*. It cannot tell that the
+tool is no longer the one you approved: a server can change a tool's
+description or schema after you looked at it (the "rug pull", as in the
+Deadbugz campaign of August 2026) and your model reads the new text. The
+lockfile closes that gap. `mcp-audit lock` writes `mcp.lock`, a SHA-256 of
+every tool each server listed when you approved it (the format is in
+`docs/LOCKFILE.md`, identical in both tools); the jail compares every
+`tools/list` answer with it.
+
+```bash
+mcp-audit lock --launch                       # once, when you approve the tools
+mcp-jail --policy policy.json --lockfile mcp.lock -- npx -y some-mcp-server
+```
+
+The server in the lockfile is the one started with the same command and
+arguments (environment values do not count). If the lockfile names it
+differently, say which: `--lock-server NAME`. If the command is not the one
+that was locked, the jail does not start the server (`exit 2`), unless
+`--on-drift warn` is given.
+
+What happens when a tool is new or its description or schema is not the
+locked one is `--on-drift`:
+
+| mode | the `tools/list` answer | a call to a changed or new tool |
+|------|-------------------------|---------------------------------|
+| `block` (default) | replaced by an error | refused |
+| `strip` | the changed and new tools are removed | refused |
+| `ask` | you are asked on the terminal (`/dev/tty`, `CONIN$`); yes allows that change for this session only; no answer in 60 seconds, no terminal, or no, is `block` | as answered |
+| `warn` | passed on as it is | passed on |
+
+Every finding is a line in the audit log (`mcp-jail --audit` shows it as
+`[lockfile: description_changed]`), whatever the mode. A tool that is gone
+from the list, and a change in a tool's `annotations` (only hints), are
+recorded but never block. A removed tool is only noticed on a complete list:
+an answer with a `nextCursor`, or to a request with a `cursor`, is one page.
+The time spent waiting for your answer is not counted against `--timeout`.
+
+This is a comparison of hashes, nothing else: it does not read the
+description or judge it. It does not say that a server was safe when you
+locked it (run `mcp-audit` on it), and it only sees a change when the client
+asks for the list again. A tool the policy allows but the lockfile does not
+know is refused (`block`, `strip`, `ask` without a yes).
+
+## Shadow mode: try a policy before you enforce it
+
+```bash
+mcp-jail --policy policy.json --lockfile mcp.lock --shadow \
+         --shadow-report shadow.json -- npx -y some-mcp-server
+```
+
+`--shadow` checks everything as usual but enforces nothing. **Calls that the
+policy or the lockfile would refuse are passed to the server**, tool lists
+are not changed, `--on-drift ask` is not asked. The audit log records those
+as `would-deny` (shown as `SHADOW`), and when the session ends the jail
+prints what would have been blocked and how many times (and writes it as JSON
+to `--shadow-report`). Use it for a week on a real workflow before you turn a
+tight policy on, never as protection.
+
+## verify-policy: test a policy without a server
+
+```bash
+mcp-jail learn --script calls.json --out policy.json --record session.json -- <server>
+mcp-jail verify-policy --policy policy.json --session session.json
+```
+
+`verify-policy` replays a recorded session against a policy and checks each
+call is allowed or refused as you expect. It starts no server and asks the same
+function the running jail asks. Exit `0`: all as expected; `1`: at least one
+was not; `2`: the policy or the session could not be used. A session is a list
+of `learn --script` calls (each expected to be allowed), or
+
+```json
+{"version": 1, "calls": [
+  {"tool": "read_file", "arguments": {"path": "/tmp/a"}, "expect": "allow"},
+  {"tool": "delete_all", "expect": "deny"},
+  {"method": "resources/list", "expect": "deny"}]}
+```
+
+`--format json` prints the results for a script. `learn --record FILE` writes
+the calls it saw as such a file. It tests the policy file (tool and method
+rules); it does not check the lockfile.
+
 ## Exit codes
 
 | code | meaning |
 |------|---------|
 | `0`  | a clean session: the client finished and every request it sent was answered (a denied call is the jail doing its job, not a failure); or `--audit` / `--init-policy` / `learn` succeeded |
-| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not found or not executable, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early |
+| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not found or not executable, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early, a `--lockfile` that is missing, unreadable, invalid or has no entry for this server (or one for another command) |
 | `3`  | the server failed while the jail was relaying: it exited or closed its pipes while the client was still talking to it, stopped reading its input, or left a request unanswered past `--timeout` |
 | `143`, `129` | mcp-jail was told to stop by SIGTERM or SIGHUP and wound the session down first (128 plus the signal number; see *Signals* above) |
 
@@ -582,6 +666,10 @@ patterns and on `learn` above apply as well):
   different file. Deny entries want that folding; allow entries would
   rather not have it. Prefer `deny_tools` / `deny_methods` for resources,
   or keep to lowercase URIs.
+- **`--on-drift ask` needs a terminal.** It reads the answer from `/dev/tty`
+  (`CONIN$` on Windows, where this has not been tried on a real console); under
+  a desktop client with no terminal the answer is always no, which is `block`.
+  An answer typed after the 60 seconds are over is thrown away.
 - **A stalled server is stopped by killing the process mcp-jail
   started.** A grandchild that still holds the server's stdin open
   (`npx` starting node) is not, and a write stuck on it can outlive the

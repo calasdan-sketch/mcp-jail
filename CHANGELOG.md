@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.7.0
+
+- **New: `--lockfile mcp.lock`.** Compares every `tools/list` answer with the
+  lockfile `mcp-audit lock` writes (format in `docs/LOCKFILE.md`, shared with
+  mcp-audit and covered by the same test vectors). `--on-drift` says what
+  happens to a new or changed tool: `block` (default), `strip`, `ask` or
+  `warn`. Every finding goes to the audit log. A different server command
+  than the locked one stops the start. `--lock-server NAME` picks the entry.
+  Hashes only: nothing is scored or guessed.
+- **New: `--shadow`** (and `--shadow-report FILE`). Checks the policy and the
+  lockfile, enforces nothing, and reports what would have been blocked.
+  Denied calls do reach the server in this mode.
+- **New: `mcp-jail verify-policy --policy P --session S`.** Replays a recorded
+  session against a policy and checks each decision. Exit 0, 1 or 2.
+  `mcp-jail learn --record FILE` writes such a session.
+- `--audit` shows lockfile findings and `SHADOW` records.
+- Waiting for an `--on-drift ask` answer no longer counts against `--timeout`.
+
 ## 0.6.4
 
 - **Fixed: every release failed.** The release workflow's version check was a
