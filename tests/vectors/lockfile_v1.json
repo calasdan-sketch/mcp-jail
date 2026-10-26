@@ -1,0 +1,308 @@
+{
+ "spec": "docs/LOCKFILE.md",
+ "spec_sha256": "76a1367d96b2b95d75067f3ce07c35f7ede2d7c4d7234373fbcaac619d56f899",
+ "format_version": 1,
+ "canonical": [
+  {
+   "label": "keys sorted",
+   "value": {
+    "b": 1,
+    "a": 2
+   },
+   "canonical": "{\"a\":2,\"b\":1}",
+   "sha256": "d3626ac30a87e6f7a6428233b3c68299976865fa5508e4267c5415c76af7a772"
+  },
+  {
+   "label": "NFD string becomes NFC",
+   "value": "cafe\u0301",
+   "canonical": "\"caf\u00e9\"",
+   "sha256": "28380feb8724d669bc8d4cf5b5a5bb1adbdc61b81ebd06f3fabc567b4f3b0fc5"
+  },
+  {
+   "label": "NFD key becomes NFC",
+   "value": {
+    "e\u0301": 1
+   },
+   "canonical": "{\"\u00e9\":1}",
+   "sha256": "ddcfcf4765da163969972bb20660092ca2787782d9352d1d8a38e93f70acf3bf"
+  },
+  {
+   "label": "integral float is an integer",
+   "value": 1.0,
+   "canonical": "1",
+   "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+  },
+  {
+   "label": "negative zero",
+   "value": -0.0,
+   "canonical": "0",
+   "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"
+  },
+  {
+   "label": "fraction kept",
+   "value": 1.5,
+   "canonical": "1.5",
+   "sha256": "9f29a130438b81170b92a42650f9a94291ecad60bd47af2a3886e75f7f728725"
+  },
+  {
+   "label": "float at 2^53 stays a float",
+   "value": 9007199254740992.0,
+   "canonical": "9007199254740992.0",
+   "sha256": "0ad10bbdda8db20784fb3edc08722b255b8da67f2a12bb58ec32994ba4a3596e"
+  },
+  {
+   "label": "large exponent",
+   "value": 1e+300,
+   "canonical": "1e+300",
+   "sha256": "2b0de494c41db4c1bf0b41b0a3483db71f2b53a5e37caf5a61abee2d4169a935"
+  },
+  {
+   "label": "big integer",
+   "value": 12345678901234567890,
+   "canonical": "12345678901234567890",
+   "sha256": "6ed645ef0e1abea1bf1e4e935ff04f9e18d39812387f63cda3415b46240f0405"
+  },
+  {
+   "label": "nested",
+   "value": {
+    "z": [
+     true,
+     false,
+     null,
+     {
+      "y": "x"
+     }
+    ]
+   },
+   "canonical": "{\"z\":[true,false,null,{\"y\":\"x\"}]}",
+   "sha256": "8c4242187ef50fd8ed83a9c186e9dcda0c49961614711b05d7813b495de45af5"
+  },
+  {
+   "label": "control characters and quotes",
+   "value": "a\u0001b\n\"\\",
+   "canonical": "\"a\\u0001b\\n\\\"\\\\\"",
+   "sha256": "f16e4d5ad5063b98b2d3d3b7ee6b3689ebf1e84d6e149e7c214b75f7eed569ae"
+  },
+  {
+   "label": "all short escapes",
+   "value": "\b\t\n\f\r",
+   "canonical": "\"\\b\\t\\n\\f\\r\"",
+   "sha256": "6e62a535b04fecef3e63e0a67bc2a0657383132fed040cbe7fcb725ed72bae27"
+  },
+  {
+   "label": "line separator, DEL and an emoji are written as themselves",
+   "value": "\u2028\u007f\ud83d\ude00",
+   "canonical": "\"\u2028\u007f\ud83d\ude00\"",
+   "sha256": "d619b530cb3cf3eba61031256958b75239421f3a4d28b2b913045af84919c2c2"
+  },
+  {
+   "label": "empty containers",
+   "value": {
+    "a": {},
+    "b": [],
+    "c": ""
+   },
+   "canonical": "{\"a\":{},\"b\":[],\"c\":\"\"}",
+   "sha256": "e052004170cc85d084722ffe760c499548014bfdbdf5275548b688255770dfc2"
+  },
+  {
+   "label": "null",
+   "value": null,
+   "canonical": "null",
+   "sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+  },
+  {
+   "label": "keys sort by code point, not by locale",
+   "value": {
+    "B": 1,
+    "a": 2,
+    "\u00e9": 3,
+    "Z": 4
+   },
+   "canonical": "{\"B\":1,\"Z\":4,\"a\":2,\"\u00e9\":3}",
+   "sha256": "9bd75e04ab2ca84fb8c5c95b85038dc54edfd0977542069a8be95a529ced4460"
+  }
+ ],
+ "tools": [
+  {
+   "label": "a full tool",
+   "tool": {
+    "name": "read_file",
+    "description": "Read a file.",
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    },
+    "annotations": {
+     "readOnlyHint": true
+    }
+   },
+   "sha256": "4e2ac5c92e90f6f565f55fc5b1486b50a6964227899847718578ebcd894c405d",
+   "description_sha256": "f83d56c834a0029f639f3db5e497620fcad6f2a8367d31e34238a3a9ae0c2020",
+   "schema_sha256": "923b083c9bcab2e3d3e07c7d9b4401688ad9f3d5e2c2f0c48fcd43052bdcb71b",
+   "annotations_sha256": "8803fb4b4971327e527bfc007f694c25d5553baffc4acd00784c86ae97dfd056"
+  },
+  {
+   "label": "name only: missing parts hash as null",
+   "tool": {
+    "name": "ping"
+   },
+   "sha256": "b99d4102998dea643c999cf5d6f02c88616a2b38de7701b4d1b4f5aacc7da171",
+   "description_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+   "schema_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+   "annotations_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+  },
+  {
+   "label": "NFD name and description",
+   "tool": {
+    "name": "cafe\u0301",
+    "description": "Cre\u0301er",
+    "inputSchema": {
+     "type": "object"
+    }
+   },
+   "sha256": "d51665055329735b98b2a60de101020c1d521a06b1c1777485b17eb9b16516e2",
+   "description_sha256": "0d94cc0e64a21491ae3fc2c13ac2ec1f707732ec75376f23ac5fcae5bd21627a",
+   "schema_sha256": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+   "annotations_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+  },
+  {
+   "label": "the same in NFC hashes the same",
+   "tool": {
+    "name": "caf\u00e9",
+    "description": "Cr\u00e9er",
+    "inputSchema": {
+     "type": "object"
+    }
+   },
+   "sha256": "d51665055329735b98b2a60de101020c1d521a06b1c1777485b17eb9b16516e2",
+   "description_sha256": "0d94cc0e64a21491ae3fc2c13ac2ec1f707732ec75376f23ac5fcae5bd21627a",
+   "schema_sha256": "a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0",
+   "annotations_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+  },
+  {
+   "label": "null description, 1.0 in the schema",
+   "tool": {
+    "name": "echo",
+    "description": null,
+    "inputSchema": {
+     "type": "object",
+     "properties": {
+      "n": {
+       "type": "number",
+       "minimum": 1.0
+      }
+     }
+    }
+   },
+   "sha256": "88171ae86faa853791301b8c1efc2cb232ccf88804812d1f6d8cb83df0b92606",
+   "description_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b",
+   "schema_sha256": "b221ac3729a706449b8d1fde3f6e86f1f652cf5bad6240a724101dd08b9d5ff4",
+   "annotations_sha256": "74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b"
+  }
+ ],
+ "commands": [
+  {
+   "label": "npx with arguments",
+   "command": "npx",
+   "args": [
+    "-y",
+    "@modelcontextprotocol/server-filesystem",
+    "/tmp"
+   ],
+   "url": null,
+   "fingerprint": "1c5f706ede69a5445acb74fa237bb02c19218618f00b8b605a013f0607eb0d52"
+  },
+  {
+   "label": "no arguments",
+   "command": "uvx",
+   "args": [],
+   "url": null,
+   "fingerprint": "ae956c2594938433f4170d3deeb327dcec9c6f5dce51af1797b16503de4c1ab7"
+  },
+  {
+   "label": "a remote server",
+   "command": null,
+   "args": null,
+   "url": "https://example.com/mcp",
+   "fingerprint": "b6ab9af4649e26f4b90a7786ee4b70f287a0b0189551386e1accb431f4e97986"
+  },
+  {
+   "label": "non-ASCII argument in NFD",
+   "command": "node",
+   "args": [
+    "cafe\u0301.js"
+   ],
+   "url": null,
+   "fingerprint": "1c70898c0a6f8a1cd2eeb7aa18af124b997d287f3a097e36b9d3dde51d146dc3"
+  }
+ ],
+ "invalid": [
+  {
+   "label": "lone surrogate",
+   "value": "\ud800"
+  },
+  {
+   "label": "keys equal after NFC",
+   "value": {
+    "\u00e9": 1,
+    "e\u0301": 2
+   }
+  }
+ ],
+ "lock": {
+  "servers": {
+   "files": {
+    "command": "npx",
+    "args": [
+     "-y",
+     "@modelcontextprotocol/server-filesystem",
+     "/tmp"
+    ],
+    "tools": [
+     {
+      "name": "read_file",
+      "description": "Read a file.",
+      "inputSchema": {
+       "type": "object",
+       "properties": {
+        "path": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "path"
+       ]
+      },
+      "annotations": {
+       "readOnlyHint": true
+      }
+     },
+     {
+      "name": "ping"
+     }
+    ]
+   },
+   "remote": {
+    "url": "https://example.com/mcp",
+    "tools": [
+     {
+      "name": "cafe\u0301",
+      "description": "Cre\u0301er",
+      "inputSchema": {
+       "type": "object"
+      }
+     }
+    ]
+   }
+  },
+  "text": "{\n  \"generated_by\": \"mcp-audit 0.3.0\",\n  \"servers\": {\n    \"files\": {\n      \"command_fingerprint\": \"1c5f706ede69a5445acb74fa237bb02c19218618f00b8b605a013f0607eb0d52\",\n      \"tools\": {\n        \"ping\": {\n          \"annotations_sha256\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\n          \"description_sha256\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\n          \"schema_sha256\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\n          \"sha256\": \"b99d4102998dea643c999cf5d6f02c88616a2b38de7701b4d1b4f5aacc7da171\"\n        },\n        \"read_file\": {\n          \"annotations_sha256\": \"8803fb4b4971327e527bfc007f694c25d5553baffc4acd00784c86ae97dfd056\",\n          \"description_sha256\": \"f83d56c834a0029f639f3db5e497620fcad6f2a8367d31e34238a3a9ae0c2020\",\n          \"schema_sha256\": \"923b083c9bcab2e3d3e07c7d9b4401688ad9f3d5e2c2f0c48fcd43052bdcb71b\",\n          \"sha256\": \"4e2ac5c92e90f6f565f55fc5b1486b50a6964227899847718578ebcd894c405d\"\n        }\n      }\n    },\n    \"remote\": {\n      \"command_fingerprint\": \"b6ab9af4649e26f4b90a7786ee4b70f287a0b0189551386e1accb431f4e97986\",\n      \"tools\": {\n        \"cafe\u0301\": {\n          \"annotations_sha256\": \"74234e98afe7498fb5daf1f36ac2d78acc339464f950703b8c019892f982b90b\",\n          \"description_sha256\": \"0d94cc0e64a21491ae3fc2c13ac2ec1f707732ec75376f23ac5fcae5bd21627a\",\n          \"schema_sha256\": \"a2c799262a3ce3c19ef5cdd983bf3d12b43ab3c426227091b909dcb7054738c0\",\n          \"sha256\": \"d51665055329735b98b2a60de101020c1d521a06b1c1777485b17eb9b16516e2\"\n        }\n      }\n    }\n  },\n  \"version\": 1\n}\n"
+ }
+}

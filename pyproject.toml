@@ -4,18 +4,33 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcp-jail"
-version = "0.6.2"
+version = "0.7.0"
 description = "Runtime permission firewall for MCP servers (stdio proxy)"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
+authors = [{ name = "Calas Automations Inc." }]
+keywords = ["mcp", "model-context-protocol", "security", "firewall", "proxy",
+            "policy", "audit", "ai-agents", "least-privilege"]
 classifiers = [
-    "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
+    "Development Status :: 4 - Beta",
     "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
 ]
+
+[project.urls]
+Homepage = "https://github.com/calasdan-sketch/mcp-jail"
+Issues = "https://github.com/calasdan-sketch/mcp-jail/issues"
+Changelog = "https://github.com/calasdan-sketch/mcp-jail/blob/main/CHANGELOG.md"
 
 [project.scripts]
 mcp-jail = "mcp_jail.cli:main"

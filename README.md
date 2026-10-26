@@ -37,9 +37,17 @@ not start (a script with no `#!` line).
 Zero dependencies — Python 3.10+ stdlib only.
 
 ```bash
-pip install git+https://github.com/calasdan-sketch/mcp-jail
+pip install mcp-jail
 mcp-jail --version
 ```
+
+(From source: `git clone https://github.com/calasdan-sketch/mcp-jail && pip
+install ./mcp-jail`.) Not to be confused with `mcpjail`, a different,
+unrelated project on PyPI: this one is **`mcp-jail`**, with a hyphen, and
+installs the `mcp-jail` command. Run that command, not
+`python -m mcp_jail`: `-m` imports an `mcp_jail/` package from the current
+directory first, which in a repository you have just cloned is that
+repository's code.
 
 ## Usage
 
@@ -59,7 +67,16 @@ mcp-jail --help                              # every flag, explained
 (`%USERPROFILE%\.mcp-jail\policy.json` on Windows), creating the
 directory; `--path FILE` writes it there instead. It refuses to replace a
 file that is already there (one line on stderr, exit `2`) unless you add
-`--force`.
+`--force`. A path it cannot write (a read-only folder, a directory, no
+permission) is the same one line and exit `2`, not a traceback.
+
+**The starter policy allows every tool and blocks nothing**, and
+`--init-policy` says so when it writes it (stderr), as `mcp-jail` does each
+time it starts with a copy of it that you have not tightened. It is a place to
+begin: run `mcp-jail learn -- <server command>` to write a tight allowlist from
+a real session, or edit the file; its `_examples` entry (a note, never read)
+holds stricter policies to copy from - only the tools you use, named tools
+blocked, a path limit on `read_file`, a refused method family.
 
 Policy (`policy.json`):
 
@@ -163,6 +180,27 @@ contents and prompts, and a log of them is a second copy of your
 secrets. Logged string values are cut to 200 characters. `audit_args: "all"` turns full
 logging on if you want it.
 
+The log does not grow for ever: when `audit.jsonl` passes 10 MiB it is
+renamed to `audit.jsonl.1` (replacing the one before) and a new file starts,
+so the two hold at most about 20 MiB. `MCP_JAIL_AUDIT_MAX_MB` changes the
+limit (fractions allowed; `0` never rotates). `--audit` reads the current file
+only; the older records are in `audit.jsonl.1`. Several jails (one per
+configured server) share the one log: the check and the rename are done under
+a lock (`audit.jsonl.lock`, next to the log), so only one of them rotates and
+the history is never replaced by a nearly empty file. If the lock cannot be
+had within two seconds the log is not rotated that time.
+
+`--max-message-bytes N` (default 16777216, 16 MiB; from 1024 to 2^40): the
+longest message - one line, newline included - the jail reads from the client
+or from the server. A longer client message is refused with `-32600` (under
+its id when the first or the last bytes show one) and a longer server response
+fails the request it answers with `-32603` - at once, whether its `id` comes
+first (`{"jsonrpc":"2.0","id":7,...`) or last (`...,"id":7}`); an `id` anywhere
+else is not trusted and that request waits for `--timeout`. Both are on the
+audit record (`rejected`). `mcp-jail learn` takes the same option. The rest of the line is read and thrown away in pieces: it is
+never held in memory, so a 400 MB line costs neither the memory nor the time
+it did.
+
 `--timeout N` (default 30; `0` waits for ever): seconds to wait for each
 server response before the jail fails closed with a JSON-RPC timeout
 error, and for the server to take each message off its stdin. N is a
@@ -218,12 +256,96 @@ override in a reason or a tool name (the client chooses it) is shown as
 an escape (`\n`, `\x1b`, `\u202e`), so it cannot forge a line of the
 report or drive your terminal.
 
+## Lockfile: catch a rug pull
+
+A policy limits what a tool may be *called with*. It cannot tell that the
+tool is no longer the one you approved: a server can change a tool's
+description or schema after you looked at it (the "rug pull", as in the
+Deadbugz campaign of August 2026) and your model reads the new text. The
+lockfile closes that gap. `mcp-audit lock` writes `mcp.lock`, a SHA-256 of
+every tool each server listed when you approved it (the format is in
+`docs/LOCKFILE.md`, identical in both tools); the jail compares every
+`tools/list` answer with it.
+
+```bash
+mcp-audit lock --launch                       # once, when you approve the tools
+mcp-jail --policy policy.json --lockfile mcp.lock -- npx -y some-mcp-server
+```
+
+The server in the lockfile is the one started with the same command and
+arguments (environment values do not count). If the lockfile names it
+differently, say which: `--lock-server NAME`. If the command is not the one
+that was locked, the jail does not start the server (`exit 2`), unless
+`--on-drift warn` is given.
+
+What happens when a tool is new or its description or schema is not the
+locked one is `--on-drift`:
+
+| mode | the `tools/list` answer | a call to a changed or new tool |
+|------|-------------------------|---------------------------------|
+| `block` (default) | replaced by an error | refused |
+| `strip` | the changed and new tools are removed | refused |
+| `ask` | you are asked on the terminal (`/dev/tty`, `CONIN$`); yes allows that change for this session only; no answer in 60 seconds, no terminal, or no, is `block` | as answered |
+| `warn` | passed on as it is | passed on |
+
+Every finding is a line in the audit log (`mcp-jail --audit` shows it as
+`[lockfile: description_changed]`), whatever the mode. A tool that is gone
+from the list, and a change in a tool's `annotations` (only hints), are
+recorded but never block. A removed tool is only noticed on a complete list:
+an answer with a `nextCursor`, or to a request with a `cursor`, is one page.
+The time spent waiting for your answer is not counted against `--timeout`.
+
+This is a comparison of hashes, nothing else: it does not read the
+description or judge it. It does not say that a server was safe when you
+locked it (run `mcp-audit` on it), and it only sees a change when the client
+asks for the list again. A tool the policy allows but the lockfile does not
+know is refused (`block`, `strip`, `ask` without a yes).
+
+## Shadow mode: try a policy before you enforce it
+
+```bash
+mcp-jail --policy policy.json --lockfile mcp.lock --shadow \
+         --shadow-report shadow.json -- npx -y some-mcp-server
+```
+
+`--shadow` checks everything as usual but enforces nothing. **Calls that the
+policy or the lockfile would refuse are passed to the server**, tool lists
+are not changed, `--on-drift ask` is not asked. The audit log records those
+as `would-deny` (shown as `SHADOW`), and when the session ends the jail
+prints what would have been blocked and how many times (and writes it as JSON
+to `--shadow-report`). Use it for a week on a real workflow before you turn a
+tight policy on, never as protection.
+
+## verify-policy: test a policy without a server
+
+```bash
+mcp-jail learn --script calls.json --out policy.json --record session.json -- <server>
+mcp-jail verify-policy --policy policy.json --session session.json
+```
+
+`verify-policy` replays a recorded session against a policy and checks each
+call is allowed or refused as you expect. It starts no server and asks the same
+function the running jail asks. Exit `0`: all as expected; `1`: at least one
+was not; `2`: the policy or the session could not be used. A session is a list
+of `learn --script` calls (each expected to be allowed), or
+
+```json
+{"version": 1, "calls": [
+  {"tool": "read_file", "arguments": {"path": "/tmp/a"}, "expect": "allow"},
+  {"tool": "delete_all", "expect": "deny"},
+  {"method": "resources/list", "expect": "deny"}]}
+```
+
+`--format json` prints the results for a script. `learn --record FILE` writes
+the calls it saw as such a file. It tests the policy file (tool and method
+rules); it does not check the lockfile.
+
 ## Exit codes
 
 | code | meaning |
 |------|---------|
 | `0`  | a clean session: the client finished and every request it sent was answered (a denied call is the jail doing its job, not a failure); or `--audit` / `--init-policy` / `learn` succeeded |
-| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not found or not executable, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early |
+| `2`  | unusable input: a policy that is missing or refused (the server is never started), a server command that is not found or not executable, an option value that is not a finite number of seconds (or a `--limit` below 1), a standard input or output that is closed (there is no client to talk to: one line on stderr, the server is never started), a `learn` session that ended early, a `--lockfile` that is missing, unreadable, invalid or has no entry for this server (or one for another command) |
 | `3`  | the server failed while the jail was relaying: it exited or closed its pipes while the client was still talking to it, stopped reading its input, or left a request unanswered past `--timeout` |
 | `143`, `129` | mcp-jail was told to stop by SIGTERM or SIGHUP and wound the session down first (128 plus the signal number; see *Signals* above) |
 
@@ -531,12 +653,23 @@ The jail is a transparent JSON-RPC relay apart from the policy check:
 What mcp-jail does not do, in plain words (the two caveats on deny
 patterns and on `learn` above apply as well):
 
+- **Tool names in `allow_tools` are folded too.** The case-folding and NFKC
+  normalisation that make `Delete_All` match a deny entry for `delete_all`
+  apply to allow entries as well: allowing `read_file` also allows a tool
+  the server calls `READ_FILE` or `read_file` with a zero-width space in it,
+  and two tools whose names differ only that way are one tool to the policy.
+  If a server really has such look-alike tools, deny the one you do not want
+  by its normalised name.
 - **A URI in `allow_tools` is compared like a tool name**: NFKC-normalised
   and case-folded. A policy that allows `file:///srv/Public` also allows
   `file:///srv/public`, which on a case-sensitive file system is a
   different file. Deny entries want that folding; allow entries would
   rather not have it. Prefer `deny_tools` / `deny_methods` for resources,
   or keep to lowercase URIs.
+- **`--on-drift ask` needs a terminal.** It reads the answer from `/dev/tty`
+  (`CONIN$` on Windows, where this has not been tried on a real console); under
+  a desktop client with no terminal the answer is always no, which is `block`.
+  An answer typed after the 60 seconds are over is thrown away.
 - **A stalled server is stopped by killing the process mcp-jail
   started.** A grandchild that still holds the server's stdin open
   (`npx` starting node) is not, and a write stuck on it can outlive the

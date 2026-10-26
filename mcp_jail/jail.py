@@ -25,9 +25,11 @@ import contextlib
 import difflib
 import fnmatch
 import heapq
+import importlib
 import io
 import itertools
 import json
+from . import _depth as depth_mod
 import math
 import os
 import queue
@@ -43,6 +45,8 @@ import time
 import unicodedata
 
 from . import VERSION
+from . import lockfile as lf
+from . import lockguard
 
 # The MCP revision learn offers in its initialize handshake. The server
 # answers with the revision it will speak; stdio has nowhere else to put
@@ -72,6 +76,16 @@ _IDLE_WAKE = 0.5
 # is still there is sent SIGTERM (terminate(): TerminateProcess on Windows) and,
 # if it ignores that for _TERM_WAIT seconds, killed.
 DEFAULT_GRACE = 5.0
+#: The longest message (one line, newline included) the jail reads from
+#: either side. A longer one is refused without ever being held in memory.
+DEFAULT_MAX_MESSAGE = 16 * 1024 * 1024
+MIN_MAX_MESSAGE = 1024
+#: --max-message-bytes above this is refused: past what a read call can take
+#: (a larger number died in OverflowError), and 1 TiB is not a limit anyone
+#: needs.
+MAX_MAX_MESSAGE = 2 ** 40
+#: The audit log is rotated to audit.jsonl.1 when it grows past this.
+AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024
 _TERM_WAIT = 5.0
 
 
@@ -86,6 +100,19 @@ def seconds_problem(value) -> "str | None":
         return "must be a finite number of seconds"
     if value < 0:
         return "must not be negative"
+    return None
+
+
+def max_message_problem(value) -> "str | None":
+    """Why `value` cannot be --max-message-bytes (None: it can)."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return f"--max-message-bytes {value!r} is not a whole number"
+    if value < MIN_MAX_MESSAGE:
+        return (f"--max-message-bytes {value!r} must be at least "
+                f"{MIN_MAX_MESSAGE}")
+    if value > MAX_MAX_MESSAGE:
+        return (f"--max-message-bytes {value!r} must be at most "
+                f"{MAX_MAX_MESSAGE} (1 TiB)")
     return None
 
 
@@ -389,7 +416,7 @@ def _compile_rule_set(spec, where: str = "arg_rules",
 POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
                "deny_methods", "strict_args", "audit_args", "hide_denied")
 # Notes: written by --init-policy and by `learn`, never read.
-NOTE_KEYS = ("_comment", "_not_called")
+NOTE_KEYS = ("_comment", "_examples", "_not_called")
 RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
 # compile_policy() marks the dict it has compiled with these; a policy
 # file must not be able to carry them (a forged marker skips validation).
@@ -608,9 +635,40 @@ def load_policy(path: str) -> dict:
     return compile_policy(pol)
 
 
+_PERMISSIVE_WARNING = (
+    "mcp-jail: warning: this policy allows every tool and blocks nothing "
+    "(it is still the starter policy). `mcp-jail learn -- <server command>` writes "
+    "a tight allowlist from a real session; see the README.")
+
+
+_STARTER_MARK = "mcp-jail STARTER policy"
+
+
+def _is_unedited_starter(pol: dict) -> bool:
+    """The policy --init-policy wrote, still blocking nothing: its own note
+    is there and no tool, argument or method is restricted."""
+    note = pol.get("_comment")
+    return (isinstance(note, str) and note.startswith(_STARTER_MARK)
+            and _blocks_nothing(pol))
+
+
+def _blocks_nothing(pol: dict) -> bool:
+    """True for a policy that lets every call through: every tool allowed
+    (`allow_tools` absent or holding `*`), nothing denied, no argument rules
+    and no refused method. strict_args blocks: a tool without allow patterns
+    then accepts only empty arguments."""
+    allow = pol.get("allow_tools")
+    return ((allow is None or "*" in allow) and not pol.get("deny_tools")
+            and not pol.get("arg_rules") and not pol.get("deny_methods")
+            and not pol.get("strict_args"))
+
+
 def default_policy() -> dict:
     return {
-        "_comment": "mcp-jail policy. Unknown keys are refused at startup. "
+        "_comment": _STARTER_MARK + ": it allows every tool and blocks "
+                    "nothing - tighten it before you rely on it (see "
+                    "_examples, which is never read, and `mcp-jail learn`). "
+                    "Unknown keys are refused at startup. "
                     "allow_tools/deny_tools are tool names "
                     "('*' = all; deny wins; names are compared normalised: "
                     "NFKC, case-folded, trimmed, invisible characters "
@@ -628,6 +686,17 @@ def default_policy() -> dict:
                     "see them. Only tools/call (plus policed_methods, e.g. "
                     "prompts/get, resources/read) is checked; deny_methods "
                     "refuses whole JSON-RPC methods ('resources/*').",
+        "_examples": {
+            "only the tools you use (then run `mcp-jail learn`)": {
+                "allow_tools": ["read_file", "list_directory"],
+                "strict_args": True},
+            "block named tools": {"deny_tools": ["run_command",
+                                                 "delete_file"]},
+            "limit a tool's arguments": {"arg_rules": {"read_file": {
+                "allow": {"path": ["^/home/me/project/"]},
+                "deny": {"**.path": ["\\.\\."]}}}},
+            "refuse a family of methods": {"deny_methods": ["resources/*"]},
+        },
         "allow_tools": ["*"],
         "deny_tools": [],
         "arg_rules": {},
@@ -898,6 +967,110 @@ def _open_private_append(path: str):
     return os.fdopen(fd, "a", encoding="utf-8")
 
 
+def audit_log_limit() -> "int | None":
+    """Bytes at which the audit log is rotated: MCP_JAIL_AUDIT_MAX_MB
+    (megabytes, fractions allowed; 0 = never) or AUDIT_LOG_MAX_BYTES. A value
+    that is not a finite number >= 0 is ignored."""
+    raw = os.environ.get("MCP_JAIL_AUDIT_MAX_MB")
+    if raw and raw.strip():
+        try:
+            megabytes = float(raw)
+        except ValueError:
+            megabytes = None
+        if megabytes is not None and 0 <= megabytes < float("inf"):
+            try:
+                return int(megabytes * 1024 * 1024) or None
+            except OverflowError:
+                return None
+    return AUDIT_LOG_MAX_BYTES
+
+
+_rotate_lock = threading.Lock()
+_LOCK_WAIT = 2.0
+
+
+@contextlib.contextmanager
+def _exclusive(lock_path: str):
+    """Hold an exclusive lock on `lock_path` (a file next to the log, made
+    0600) among every mcp-jail on this machine, and say whether it was got:
+    `with _exclusive(p) as got:`. It waits at most _LOCK_WAIT seconds and
+    never raises - a jail whose log cannot be locked must still run."""
+    got = False
+    fd = None
+    try:
+        fd = os.open(lock_path, os.O_RDWR | os.O_CREAT
+                     | getattr(os, "O_BINARY", 0), 0o600)
+        deadline = time.monotonic() + _LOCK_WAIT
+        while True:
+            try:
+                if _WINDOWS:
+                    msvcrt = importlib.import_module("msvcrt")
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl = importlib.import_module("fcntl")  # POSIX only
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got = True
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.005)
+    except (OSError, ImportError):
+        pass
+    try:
+        yield got
+    finally:
+        if fd is not None:
+            if got:
+                try:
+                    if _WINDOWS:
+                        msvcrt = importlib.import_module("msvcrt")
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    else:
+                        fcntl = importlib.import_module("fcntl")
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _rotate_audit_log(path: str) -> None:
+    """Keep the log from growing for ever: past the limit the file becomes
+    `<log>.1` (replacing the one before it) and a new log starts. So the
+    two files together hold at most about twice the limit. Best effort - a
+    log that cannot be moved (open in another process on Windows) just keeps
+    growing until it can.
+
+    Several jails share one log (one per configured server). Two of them can
+    see the log over the limit at the same moment; the second one's rename
+    then moved the NEW log - a few lines long - over `<log>.1` and the whole
+    history was gone. The size is checked again, and the file moved, while
+    holding a lock (`<log>.lock`) that every jail takes, so only the first
+    one rotates and the rest find a small log and leave it alone. If the
+    lock cannot be got in a couple of seconds the log is simply not rotated
+    this time."""
+    limit = audit_log_limit()
+    if limit is None:
+        return
+    try:
+        if os.path.getsize(path) <= limit:
+            return          # the usual case: no lock taken
+    except OSError:
+        return
+    with _rotate_lock, _exclusive(path + ".lock") as got:
+        if not got:
+            return
+        try:
+            if os.path.getsize(path) <= limit:
+                return      # another jail rotated while this one waited
+            os.replace(path, path + ".1")
+        except OSError:
+            pass
+
+
 def audit(event: dict) -> None:
     """Append one JSON line to the audit log. An unwritable log is
     reported on stderr but never takes the firewall down: the decision
@@ -906,6 +1079,7 @@ def audit(event: dict) -> None:
     event["at"] = int(time.time())
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        _rotate_audit_log(path)
         with _open_private_append(path) as f:
             f.write(json.dumps(event) + "\n")
     except OSError as e:
@@ -938,7 +1112,7 @@ def _lenient_id(line: bytes):
     can be failed closed by id rather than by guesswork. _NO_ID when there
     is none."""
     try:
-        obj = json.loads(line.decode("utf-8"), parse_int=_int_or_none)
+        obj = depth_mod.loads(line.decode("utf-8"), parse_int=_int_or_none)
     except (ValueError, RecursionError):
         return _NO_ID
     if isinstance(obj, dict) and "id" in obj:
@@ -971,7 +1145,7 @@ def _salvage_id(line: bytes):
     trust: it parses, has exactly one "id" key and that holds a string or
     an integer. Otherwise _NO_ID (the refusal then carries a null id)."""
     try:
-        obj = json.loads(line.decode("utf-8"),
+        obj = depth_mod.loads(line.decode("utf-8"),
                          object_pairs_hook=_no_duplicate_keys,
                          parse_int=_int_or_none)
     except (ValueError, RecursionError):
@@ -1016,24 +1190,35 @@ class _FdLineReader:
     def __init__(self, fd: int):
         self._fd = fd
         self._buf = bytearray()
+        self._scanned = 0       # bytes of _buf already known to hold no "\n"
         self._eof = False
 
-    def readline(self) -> bytes:
+    def readline(self, limit: int = -1) -> bytes:
+        """The next line, newline included; at most `limit` bytes of it when
+        `limit` is not negative (the rest comes with the next call, as
+        BufferedReader.readline does). The buffer is searched from where the
+        last search ended, so a line of any length costs time linear in it,
+        and it never holds more than `limit` plus one read."""
         while True:
-            i = self._buf.find(b"\n")
-            if i >= 0:
-                line = bytes(self._buf[:i + 1])
-                del self._buf[:i + 1]
-                return line
+            i = self._buf.find(b"\n", self._scanned)
+            if i >= 0 and (limit < 0 or i + 1 <= limit):
+                return self._take(i + 1)
+            if limit >= 0 and len(self._buf) >= limit:
+                return self._take(limit)
             if self._eof:
-                line = bytes(self._buf)
-                self._buf.clear()
-                return line
+                return self._take(len(self._buf))
+            self._scanned = len(self._buf)
             chunk = os.read(self._fd, 65536)
             if not chunk:
                 self._eof = True
             else:
                 self._buf += chunk
+
+    def _take(self, n: int) -> bytes:
+        line = bytes(self._buf[:n])
+        del self._buf[:n]
+        self._scanned = 0
+        return line
 
 
 def _binary_in(stream):
@@ -1219,20 +1404,87 @@ class _ServerInput:
             self._notify(failure)
 
 
+class _Oversize:
+    """What a reader queues in place of a line longer than its limit: how
+    long the line was, its first bytes and its last (to recover an id from)."""
+
+    def __init__(self, size: int, head: bytes, tail: bytes = b""):
+        self.size, self.head, self.tail = size, head, tail
+
+
+_HEAD_BYTES = 4096
+_TAIL_BYTES = 4096
+_DISCARD_CHUNK = 65536
+_HEAD_ID_RE = re.compile(
+    rb'\A\s*\{\s*(?:"jsonrpc"\s*:\s*"2\.0"\s*,\s*)?"id"\s*:\s*'
+    rb'(-?[0-9]{1,18}|"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt]){0,200}")\s*,')
+
+
+def _head_id(head: bytes):
+    """The id at the very start of the first bytes of a message that was too
+    long to read (`{"jsonrpc":"2.0","id":7,...`), or _NO_ID. Only the
+    canonical position is trusted: an id further in could belong to anything."""
+    m = _HEAD_ID_RE.match(head)
+    if not m:
+        return _NO_ID
+    try:
+        rid = depth_mod.loads(m.group(1))
+    except ValueError:
+        return _NO_ID
+    return rid if isinstance(rid, (str, int)) and not isinstance(rid, bool) \
+        else _NO_ID
+
+
+_TAIL_ID_RE = re.compile(
+    rb',\s*"id"\s*:\s*'
+    rb'(-?[0-9]{1,18}|"(?:[^"\\\x00-\x1f]|\\["\\/bfnrt]){0,200}")\s*\}\s*\Z')
+
+
+def _tail_id(tail: bytes):
+    """The id at the very end of a message that was too long to read
+    (`{"jsonrpc":"2.0","result":{...},"id":7}`), or _NO_ID. Only an id that is
+    followed by nothing but the closing brace of the message counts: one
+    inside a nested object is followed by more braces, and one inside a string
+    has its quotes escaped."""
+    m = _TAIL_ID_RE.search(tail)
+    if not m:
+        return _NO_ID
+    try:
+        rid = depth_mod.loads(m.group(1))
+    except ValueError:
+        return _NO_ID
+    return rid if isinstance(rid, (str, int)) and not isinstance(rid, bool) \
+        else _NO_ID
+
+
+def oversize_id(big: "_Oversize"):
+    """The id of the message `big` stands for: from its start when it is there,
+    else from its end. _NO_ID when neither shows one."""
+    rid = _head_id(big.head)
+    return rid if rid is not _NO_ID else _tail_id(big.tail)
+
+
 class _Reader(threading.Thread):
     """Pump lines from a binary stream into a queue as (tag, line);
-    (tag, None) marks EOF or a broken pipe."""
+    (tag, None) marks EOF or a broken pipe. A line over `max_bytes` is never
+    held: the first bytes of it are kept, the rest is read and thrown away
+    in pieces, and (tag, _Oversize) is queued instead."""
 
-    def __init__(self, stream, tag: str, q: "queue.Queue"):
+    def __init__(self, stream, tag: str, q: "queue.Queue",
+                 max_bytes: int = DEFAULT_MAX_MESSAGE):
         super().__init__(name=f"mcp-jail-{tag}-reader", daemon=True)
         self._stream, self._tag, self._q = stream, tag, q
+        self._max = max_bytes
 
     def run(self) -> None:
         try:
             while True:
-                line = self._stream.readline()
+                line = self._stream.readline(self._max + 1)
                 if not line:
                     break
+                if len(line) > self._max:
+                    self._q.put((self._tag, self._discard_rest(line)))
+                    continue
                 # Frames are newline-delimited; a Windows text-mode peer
                 # ends them with CRLF. Normalise the terminator only --
                 # the JSON bytes themselves are never touched.
@@ -1241,6 +1493,17 @@ class _Reader(threading.Thread):
             pass
         finally:
             self._q.put((self._tag, None))
+
+    def _discard_rest(self, first: bytes) -> _Oversize:
+        size, last = len(first), first
+        tail = first[-_TAIL_BYTES:]
+        while not last.endswith(b"\n"):
+            last = self._stream.readline(_DISCARD_CHUNK)
+            if not last:
+                break
+            size += len(last)
+            tail = (tail + last[-_TAIL_BYTES:])[-_TAIL_BYTES:]
+        return _Oversize(size, first[:_HEAD_BYTES], tail)
 
 
 class ServerNotFound(Exception):
@@ -1402,7 +1665,7 @@ def _parse(line: bytes):
     if not body.strip(" "):
         return None, None, ""  # blank line: protocol noise
     try:
-        obj = json.loads(body, object_pairs_hook=_no_duplicate_keys,
+        obj = depth_mod.loads(body, object_pairs_hook=_no_duplicate_keys,
                          parse_constant=_no_constants,
                          parse_float=_finite_float, parse_int=_bounded_int)
     except (_DuplicateKey, _Unrepresentable) as e:
@@ -1513,15 +1776,31 @@ class _Pending:
         self._serial = itertools.count()
 
     def add(self, req_id, method: str, deadline: float | None,
-            call=None) -> None:
+            call=None, cursor=None) -> None:
         key = _id_key(req_id)
         entry = {"id": req_id, "method": method, "deadline": deadline,
-                 "call": call, "gone": False}
+                 "call": call, "gone": False, "cursor": cursor}
         self._by_key.setdefault(key, collections.deque()).append(entry)
         self._count += 1
         if deadline is not None:
             heapq.heappush(self._heap,
                            (deadline, next(self._serial), key, entry))
+
+    def extend(self, seconds: float) -> None:
+        """Push every deadline back by `seconds`: the loop was busy (waiting
+        for the operator's answer, --on-drift ask) and the server was not at
+        fault."""
+        if seconds <= 0:
+            return
+        self._heap = []
+        for dq in self._by_key.values():
+            for entry in dq:
+                if entry["deadline"] is not None:
+                    entry["deadline"] += seconds
+                    self._heap.append((entry["deadline"],
+                                       next(self._serial),
+                                       _id_key(entry["id"]), entry))
+        heapq.heapify(self._heap)
 
     def peek(self, req_id) -> dict | None:
         """The entry pop() would return, left where it is."""
@@ -1628,15 +1907,48 @@ def _call_succeeded(msg: dict) -> bool:
     return not (isinstance(result, dict) and result.get("isError"))
 
 
+def evaluate_call(pol, mkey: str, params):
+    """The policy's decision on one policed request (tools/call, or one of
+    the policed_methods): (name, arguments, ok, reason). `pol` None is learn,
+    which allows everything. The proxy and `mcp-jail verify-policy` both ask
+    this, so a policy test and the live jail cannot disagree."""
+    params = params if isinstance(params, dict) else {}
+    targs = params.get("arguments")
+    if targs is None:
+        targs = {}
+    clash = _key_clash(params, _PARAM_KEYS)
+    if clash is not None:
+        name, why = None, "params: " + _clash_text(clash)
+    else:
+        name, why = _selected(mkey, params)
+    if why is not None:
+        ok, reason = False, why
+    elif pol is None:
+        ok, reason = True, ""
+    else:
+        ok, reason = tool_allowed(pol, name, targs)
+    return name, targs, ok, reason
+
+
 class _Proxy:
     """The proxy loop. One consumer thread (this one) reads both pumps
     from a single queue and is the only writer to either side."""
 
     def __init__(self, proc, client_in, client_out, timeout: float | None,
                  pol: dict | None, observer=None, grace: float = DEFAULT_GRACE,
-                 stop: "_StopSignals | None" = None):
+                 stop: "_StopSignals | None" = None,
+                 max_message: int = DEFAULT_MAX_MESSAGE,
+                 lock: "lockguard.LockGuard | None" = None,
+                 shadow: bool = False):
         self.proc = proc
         self.grace = grace
+        self.lock = lock
+        self.shadow = shadow
+        #: --shadow: what the policy and the lock would have refused
+        #: ((kind, subject, reason) per event) and how many calls were seen
+        self.shadow_events: dict = {}
+        self.calls_seen = 0
+        self.max_message = max_message
         self.q: "queue.SimpleQueue" = queue.SimpleQueue()
         self.client = _Writer(client_out)
         self.timeout = timeout if timeout and timeout > 0 else None
@@ -1687,8 +1999,14 @@ class _Proxy:
         return True
 
     def _audit(self, name, args, ok: bool, reason: str,
-               method: str = "tools/call") -> None:
-        event = {"decision": "allow" if ok else "deny", "reason": reason}
+               method: str = "tools/call", source: str = "") -> None:
+        """One policed call on the record. `source` "lockfile": the lockfile,
+        not the policy, said no. With --shadow a refusal is recorded as
+        "would-deny": it was not enforced."""
+        refused = "would-deny" if self.shadow else "deny"
+        event = {"decision": "allow" if ok else refused, "reason": reason}
+        if source:
+            event["drift"] = source
         if name is not None:  # None: nothing in params said what it was for
             event["tool"] = name if isinstance(name, str) else repr(name)
         if method != "tools/call" or name is None:
@@ -1725,6 +2043,16 @@ class _Proxy:
             prefix = "Parse error" if code == PARSE_ERROR else "Invalid Request"
             self.client.send(_rpc_error(req_id, code, f"{prefix}: {why}"))
         self._audit_rejected("client", why, subject, method)
+
+    def _on_client_oversize(self, big: "_Oversize") -> None:
+        """A client line past --max-message-bytes: it was not read (and is not
+        held); the client is told, under its id when the first or the last
+        bytes show one, and it is on the audit record."""
+        rid = oversize_id(big)
+        self._refuse(f"message too large ({big.size} bytes; the limit is "
+                     f"{self.max_message}, see --max-message-bytes)",
+                     req_id=None if rid is _NO_ID else rid,
+                     subject=big.head)
 
     def _on_client_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
@@ -1785,32 +2113,31 @@ class _Proxy:
         mkey = normalize_tool_name(method)
         if self.pol is not None and method_denied(self.pol, method):
             reason = f"method '{method}' is denied by policy"
-            audit({"method": method, "decision": "deny", "reason": reason})
-            if has_id:
-                self.client.send(_rpc_error(req_id, METHOD_NOT_FOUND,
-                                            f"mcp-jail denied: {reason}"))
-            return
+            if self.shadow:
+                audit({"method": method, "decision": "would-deny",
+                       "reason": reason})
+                self._shadow_note("method", method, reason)
+            else:
+                audit({"method": method, "decision": "deny",
+                       "reason": reason})
+                if has_id:
+                    self.client.send(_rpc_error(req_id, METHOD_NOT_FOUND,
+                                                f"mcp-jail denied: {reason}"))
+                return
         if (mkey == "tools/call" if self.pol is None
                 else method_policed(self.pol, method)):
-            params = msg.get("params")
-            params = params if isinstance(params, dict) else {}
-            targs = params.get("arguments")
-            if targs is None:
-                targs = {}
-            clash = _key_clash(params, _PARAM_KEYS)
-            if clash is not None:
-                name, why = None, "params: " + _clash_text(clash)
-            else:
-                name, why = _selected(mkey, params)
-            if why is not None:
-                ok, reason = False, why
-            elif self.pol is None:
-                ok, reason = True, ""
-            else:
-                ok, reason = tool_allowed(self.pol, name, targs)
+            name, targs, ok, reason = evaluate_call(self.pol, mkey,
+                                                    msg.get("params"))
+            source = ""
+            if ok and self.lock is not None and mkey == "tools/call":
+                ok, reason = self.lock.check_call(name)
+                source = "" if ok else "lockfile"
+            self.calls_seen += 1
             if self.pol is not None:
-                self._audit(name, targs, ok, reason, method)
-            if not ok:
+                self._audit(name, targs, ok, reason, method, source)
+            if not ok and self.shadow:
+                self._shadow_note("call", name, reason)
+            elif not ok:
                 # Same id, same type, as the request. A notification
                 # (no id) never gets a response — it is just dropped.
                 if has_id:
@@ -1829,7 +2156,11 @@ class _Proxy:
         if not self._forward(msg, req_id, has_id):
             return
         if has_id:
-            self.pending.add(req_id, mkey, self._deadline(), call=call)
+            cursor = None
+            if mkey == "tools/list" and isinstance(msg.get("params"), dict):
+                cursor = msg["params"].get("cursor")
+            self.pending.add(req_id, mkey, self._deadline(), call=call,
+                             cursor=cursor)
             self._cancelled.discard(_id_key(req_id))    # the id is in use again
         elif mkey == "notifications/cancelled":
             self._stop_waiting_for(msg)
@@ -1874,6 +2205,14 @@ class _Proxy:
         else:
             self._log(f"dropping a message from the server: {why}")
         self._audit_rejected("server", why, subject)
+
+    def _on_server_oversize(self, big: "_Oversize") -> None:
+        """A server line past --max-message-bytes: dropped unread. The request
+        it answers (its id, when the first bytes show it) fails with -32603;
+        otherwise that request waits for --timeout."""
+        self._refuse_server(f"response too large ({big.size} bytes; the limit "
+                            f"is {self.max_message}, see --max-message-bytes)",
+                            oversize_id(big), big.head)
 
     def _on_server_line(self, line: bytes) -> None:
         msg, code, err = _parse(line)
@@ -1959,7 +2298,8 @@ class _Proxy:
         if entry["method"] == "tools/list" and "result" in msg:
             if self.observer is not None:
                 self.observer.on_tools(msg["result"])
-            if self.pol is not None and self.pol.get("hide_denied", True):
+            hiding = self.pol is not None and self.pol.get("hide_denied", True)
+            if self.lock is not None or hiding:
                 result = msg["result"]
                 bad = (_key_clash(result, ("tools", "nextCursor"))
                        if isinstance(result, dict) else None)
@@ -1972,8 +2312,93 @@ class _Proxy:
                         f"bad response from server: {why}"))
                     self._audit_rejected("server", why, msg)
                     return False
-                filter_tools_list(self.pol, result)
+            if self.lock is not None and not self._review_tools(entry, msg):
+                return False
+            if hiding:
+                result = msg["result"]
+                if self.shadow:
+                    self._shadow_hidden(result)
+                else:
+                    filter_tools_list(self.pol, result)
         return True
+
+    # -- the lockfile ---------------------------------------------------------
+
+    def _review_tools(self, entry: dict, msg: dict) -> bool:
+        """Compare one tools/list answer with the lockfile. False when the
+        answer is not to be delivered (the client was told)."""
+        result = msg["result"]
+        complete = (not entry.get("cursor") and not (
+            isinstance(result, dict) and result.get("nextCursor")))
+        started = time.monotonic()
+        v = self.lock.review(result, complete)
+        if self.lock.mode == "ask":
+            self.pending.extend(time.monotonic() - started)
+        enforced = not self.shadow
+        refused = v.action != "pass"
+        decision = ("allow" if (not v.drift or v.approved
+                                or self.lock.mode == "warn")
+                    else ("deny" if enforced else "would-deny"))
+        for d in v.drift:
+            audit({"decision": decision, "drift": d.kind, "tool": d.tool,
+                   "server": self.lock.key, "mode": self.lock.mode,
+                   "reason": lf.KIND_TEXT[d.kind] + (
+                       f" ({d.detail})" if d.detail else "")})
+        for d in v.hints:
+            audit({"decision": "allow", "drift": d.kind, "tool": d.tool,
+                   "server": self.lock.key, "mode": "hint",
+                   "reason": lf.KIND_TEXT[d.kind]})
+        if v.drift and not v.approved:
+            self._log(f"lockfile: server '{self.lock.key}': "
+                      + self.lock.summary(v.drift)
+                      + (" - not enforced (--shadow)" if self.shadow else
+                         " - passed on (--on-drift warn)"
+                         if self.lock.mode == "warn" else ""))
+        if self.shadow:
+            if v.would != "pass" and not v.approved:
+                for d in v.drift:
+                    self._shadow_note("lockfile", d.tool or "tools/list",
+                                      lf.KIND_TEXT[d.kind])
+            return True
+        if refused and v.action == "error":
+            self.client.send(_rpc_error(
+                entry["id"], INTERNAL_ERROR, "mcp-jail: " + v.message))
+            return False
+        if v.action == "strip":
+            self.lock.strip_tools(result, v.strip)
+        return True
+
+    # -- --shadow --------------------------------------------------------------
+
+    def _shadow_note(self, kind: str, subject, reason: str) -> None:
+        key = (kind, _plain_text(subject), reason)
+        if key not in self.shadow_events and len(self.shadow_events) >= 1000:
+            key = (kind, "(others)", "more than 1000 different findings")
+        self.shadow_events[key] = self.shadow_events.get(key, 0) + 1
+
+    def _shadow_hidden(self, result) -> None:
+        """--shadow: the tools hide_denied would have taken out of a list."""
+        tools = result.get("tools") if isinstance(result, dict) else None
+        if not isinstance(tools, list):
+            return
+        for t in tools:
+            if not (isinstance(t, dict) and _key_clash(t, ("name",)) is None
+                    and tool_visible(self.pol, t.get("name"))[0]):
+                name = t.get("name") if isinstance(t, dict) else None
+                self._shadow_note("hide", name if isinstance(name, str)
+                                  else "(unnamed)", "would be hidden from "
+                                  "tools/list (hide_denied)")
+
+    def shadow_report(self) -> dict:
+        """What --shadow saw: calls seen, and each distinct thing that would
+        have been refused with how many times."""
+        counts = self.shadow_events
+        items = [{"kind": k, "subject": subj, "reason": why, "count": n}
+                 for (k, subj, why), n in sorted(counts.items())]
+        calls = sum(i["count"] for i in items if i["kind"] == "call")
+        return {"calls_seen": self.calls_seen,
+                "would_have_blocked_calls": calls,
+                "would_have_blocked": items}
 
     # -- loop ---------------------------------------------------------------
 
@@ -2101,8 +2526,8 @@ class _Proxy:
         closed its pipes while the client was still talking to it, stopped
         reading its input, or left a request unanswered past --timeout, and
         128 plus the number of the signal that stopped it."""
-        _Reader(self._client_in, "client", self.q).start()
-        _Reader(self.proc.stdout, "server", self.q).start()
+        _Reader(self._client_in, "client", self.q, self.max_message).start()
+        _Reader(self.proc.stdout, "server", self.q, self.max_message).start()
         self.server.start()
         client_open = True
         try:
@@ -2125,7 +2550,8 @@ class _Proxy:
                     if line is None:
                         client_open = False
                         continue
-                    self._handle(self._on_client_line, line)
+                    self._handle(self._on_client_line if isinstance(
+                        line, bytes) else self._on_client_oversize, line)
                 elif tag == "input":
                     if line is not None:    # writing failed: its stdin is gone
                         self._lose(f"closed its input ({line})", "server closed")
@@ -2143,7 +2569,8 @@ class _Proxy:
                         self._lose("exited or closed its output"
                                    + self._server_status(), "server closed")
                         break
-                    self._handle(self._on_server_line, line)
+                    self._handle(self._on_server_line if isinstance(
+                        line, bytes) else self._on_server_oversize, line)
         except (BrokenPipeError, KeyboardInterrupt):
             pass
         except (OSError, ValueError) as e:  # a pipe went away under us
@@ -2161,15 +2588,79 @@ class _Proxy:
         return EXIT_SERVER if (self.lost is not None or self.timed_out) else 0
 
 
+def _open_lock(lockfile: str, server_cmd: list, lock_server, mode: str,
+               ask, shadow: bool):
+    """(guard, None) for the server this jail is about to start, or (None,
+    why not). The lockfile must hold the server, and the command must be the
+    one that was locked, unless --on-drift warn (or --shadow) says to go on."""
+    path = expand_path(lockfile)
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(lf.MAX_LOCK_BYTES + 1)
+        lock = lf.parse_lock(raw)
+    except FileNotFoundError:
+        return None, (f"no lockfile at {path}; make one with `mcp-audit "
+                      "lock` (see docs/LOCKFILE.md)")
+    except OSError as e:
+        return None, f"cannot read the lockfile {path}: {e}"
+    except lf.LockError as e:
+        return None, f"{path} is not a valid lockfile: {e}"
+    try:
+        fingerprint = lf.command_fingerprint(server_cmd[0], server_cmd[1:])
+    except lf.LockError as e:     # not strings: cannot happen from the CLI
+        return None, str(e)
+    try:
+        key, entry = lf.find_server(lock, key=lock_server,
+                                    fingerprint=None if lock_server else
+                                    fingerprint)
+    except lf.LockError as e:
+        return None, f"{path}: {e} (use --lock-server NAME)"
+    if entry is None:
+        if lock_server:
+            return None, (f"{path} has no server named '{lock_server}' "
+                          f"(it has: {', '.join(sorted(lock['servers'])) or 'none'})")
+        return None, (f"no server in {path} is started with this command. "
+                      "Lock it with `mcp-audit lock`, or name the server in "
+                      "the lockfile with --lock-server")
+    if entry["command_fingerprint"] != fingerprint:
+        why = (f"server '{key}' in {path} was locked with a different "
+               "command or arguments than this one (command changed)")
+        audit({"decision": "would-deny" if shadow else "deny",
+               "method": "lockfile", "drift": lf.COMMAND_CHANGED,
+               "server": key, "mode": mode, "reason": "command changed"})
+        if mode == "warn" or shadow:
+            _say(f"mcp-jail: warning: {why}")
+        elif mode == "ask" and ask(f"mcp-jail: {why}. Start it anyway?"):
+            pass
+        else:
+            return None, why + "; refusing to start it"
+    guard = lockguard.LockGuard(key, entry, mode,
+                                (lambda q: False) if shadow else ask)
+    return guard, None
+
+
 def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
-        stdin=None, stdout=None, grace: float = DEFAULT_GRACE) -> int:
+        stdin=None, stdout=None, grace: float = DEFAULT_GRACE,
+        max_message: int = DEFAULT_MAX_MESSAGE, lockfile: "str | None" = None,
+        lock_server: "str | None" = None, on_drift: str = "block",
+        shadow: bool = False, shadow_report: "str | None" = None,
+        ask=None) -> int:
     """Run the jail: policy-check stdin -> server, pass server -> stdout.
 
     `stdin`/`stdout` default to the process's own (binary) streams; tests
     pass in-memory streams. `grace` is how long the server is given to leave
     on its own once the client has gone (0: not at all).
+
+    `lockfile`: compare every tools/list answer with this mcp.lock (see
+    lockguard); `lock_server` names the server in it (default: the one started
+    with this command); `on_drift` is block, strip, ask or warn. `shadow`:
+    evaluate the policy and the lockfile but enforce nothing, and say at the
+    end what would have been refused (also written to `shadow_report` as
+    JSON). `ask` answers on_drift="ask" questions (default: the terminal).
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
+    if problem is None:
+        problem = max_message_problem(max_message)
     if problem:
         _say(f"mcp-jail: {problem}")
         return 2
@@ -2194,6 +2685,22 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     if closed:
         _say(f"mcp-jail: {closed}")
         return 2
+    if on_drift not in lockguard.MODES:
+        _say(f"mcp-jail: --on-drift must be one of "
+             f"{', '.join(lockguard.MODES)}")
+        return 2
+    guard = None
+    if lockfile:
+        guard, why = _open_lock(lockfile, server_cmd, lock_server, on_drift,
+                                ask or lockguard.ask_on_terminal, shadow)
+        if guard is None:
+            _say(f"mcp-jail: --lockfile: {why}")
+            return 2
+    if shadow:
+        _say("mcp-jail: SHADOW MODE: the policy"
+             + (" and the lockfile are" if guard else " is")
+             + " checked but nothing is blocked - calls it would refuse are "
+               "passed on. A summary follows when the session ends.")
     with _StopSignals() as stop:
         try:
             proc = _spawn(server_cmd)
@@ -2201,10 +2708,54 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
             _say(f"mcp-jail: {_server_problem(e)}")
             return 2
         try:
-            return _Proxy(proc, client_in, client_out, timeout, pol,
-                          grace=grace, stop=stop).serve()
+            if _is_unedited_starter(pol):
+                _say(_PERMISSIVE_WARNING)
+            proxy = _Proxy(proc, client_in, client_out, timeout, pol,
+                           grace=grace, stop=stop, max_message=max_message,
+                           lock=guard, shadow=shadow)
+            try:
+                return proxy.serve()
+            finally:
+                if shadow:
+                    _finish_shadow(proxy, shadow_report)
         finally:
             _stop(proc)
+
+
+def shadow_text(report: dict) -> str:
+    """The summary --shadow prints when the session ends."""
+    lines = [f"mcp-jail: shadow summary: {report['calls_seen']} call(s) "
+             f"seen, {report['would_have_blocked_calls']} would have been "
+             "blocked. Nothing was blocked."]
+    for item in report["would_have_blocked"]:
+        n = f" x{item['count']}" if item["count"] > 1 else ""
+        what = {"call": "would block", "method": "would deny method",
+                "hide": "would hide", "lockfile": "would refuse (lockfile)"
+                }.get(item["kind"], item["kind"])
+        lines.append(f"  {what} {_plain_text(item['subject'])}{n}: "
+                     f"{_plain_text(item['reason'])}")
+    if not report["would_have_blocked"]:
+        lines.append("  the policy would have changed nothing in this "
+                     "session.")
+    return "\n".join(lines)
+
+
+def _plain_text(value) -> str:
+    return "".join(ch if ch.isprintable() else ch.encode(
+        "unicode_escape").decode("ascii") for ch in str(value))[:300]
+
+
+def _finish_shadow(proxy: "_Proxy", report_path: "str | None") -> None:
+    report = proxy.shadow_report()
+    _say(shadow_text(report))
+    if report_path:
+        try:
+            path = expand_path(report_path)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(report, f, indent=2, sort_keys=True)
+                f.write("\n")
+        except (OSError, ValueError) as e:
+            _say(f"mcp-jail: cannot write the shadow report: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -2411,15 +2962,16 @@ class _Session:
     -32601 error so the server never waits on a client that isn't there.
     """
 
-    def __init__(self, proc):
+    def __init__(self, proc, max_message: int = DEFAULT_MAX_MESSAGE):
         self.proc = proc
+        self.max_message = max_message
         self.q: "queue.Queue" = queue.Queue()
         # no stall timer of its own: request() waits with its own deadline
         self.out = _ServerInput(proc.stdin, None,
                                 lambda payload: self.q.put(("input", payload)))
         self.out.start()
         self.closed = False
-        _Reader(proc.stdout, "server", self.q).start()
+        _Reader(proc.stdout, "server", self.q, max_message).start()
 
     def notify(self, msg: dict) -> bool:
         """Send a notification (or any message) without waiting. False
@@ -2461,6 +3013,11 @@ class _Session:
             if line is None:
                 self.closed = True
                 return ("closed",)
+            if isinstance(line, _Oversize):
+                _say(f"learn: ignoring a line of {line.size} bytes from the "
+                     f"server (the limit is {self.max_message}, see "
+                     f"--max-message-bytes)")
+                continue
             obj, code, _err = _parse(line)
             if code is not None:
                 _say(f"learn: ignoring non-JSON line from server: "
@@ -2502,12 +3059,13 @@ def load_script(path: str) -> list[dict]:
 
 
 def _learn_from_script(proc, calls: list[dict], timeout: float,
-                       rec: _Recorder) -> str | None:
+                       rec: _Recorder,
+                       max_message: int = DEFAULT_MAX_MESSAGE) -> str | None:
     """Drive canned calls against the server; no client needed. A call
     is recorded only once the server answered it successfully. Returns
     None when the script ran through, else why the session ended early
     (the server refused initialize, or went away)."""
-    session = _Session(proc)
+    session = _Session(proc, max_message)
     try:
         return _drive_script(session, calls, timeout, rec)
     finally:
@@ -2575,7 +3133,9 @@ def _drive_script(session: _Session, calls: list[dict], timeout: float,
 
 def learn(server_cmd: list[str], script: str | None = None,
           out: str | None = None, timeout: float = 30.0,
-          stdin=None, stdout=None, grace: float = DEFAULT_GRACE) -> int:
+          stdin=None, stdout=None, grace: float = DEFAULT_GRACE,
+          max_message: int = DEFAULT_MAX_MESSAGE,
+          record: "str | None" = None) -> int:
     """Observe a server and emit a tight-fit allowlist policy.
 
     --script mode drives canned calls against the server (no client).
@@ -2589,6 +3149,8 @@ def learn(server_cmd: list[str], script: str | None = None,
     for review instead, so a failed run never overwrites a good policy.
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
+    if problem is None:
+        problem = max_message_problem(max_message)
     if problem:
         _say(f"mcp-jail learn: {problem}")
         return 2
@@ -2602,6 +3164,18 @@ def learn(server_cmd: list[str], script: str | None = None,
             calls = load_script(script)
         except (OSError, ValueError) as e:
             _say(f"mcp-jail learn: bad --script {script}: {e}")
+            return 2
+    if record:
+        record = expand_path(record)
+        if os.path.isdir(record):
+            _say(f"mcp-jail learn: --record {record} is a directory")
+            return 2
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(record)),
+                        exist_ok=True)
+        except OSError as e:
+            _say(f"mcp-jail learn: cannot create the directory for "
+                 f"--record {record}: {e}")
             return 2
     if out:
         out = expand_path(out)
@@ -2637,10 +3211,12 @@ def learn(server_cmd: list[str], script: str | None = None,
         failure: str | None = None
         try:
             if script is not None:
-                failure = _learn_from_script(proc, calls, timeout, rec)
+                failure = _learn_from_script(proc, calls, timeout, rec,
+                                             max_message)
             else:
                 proxy = _Proxy(proc, client_in, client_out, timeout, None,
-                               observer=rec, grace=grace, stop=stop)
+                               observer=rec, grace=grace, stop=stop,
+                               max_message=max_message)
                 try:
                     proxy.serve()
                 except KeyboardInterrupt:
@@ -2676,6 +3252,15 @@ def learn(server_cmd: list[str], script: str | None = None,
             print(text)
     else:
         print(text)
+    if record and not failure:
+        from . import policytest
+        try:
+            policytest.write_session(record, rec.calls)
+            _say(f"learn: wrote the session to {record} "
+                 f"(replay with `mcp-jail verify-policy`)")
+        except OSError as e:
+            code = 2
+            _say(f"learn: cannot write {record}: {e}")
     n_listed = len(set(rec.tools))
     n_called = len({t for t, _ in rec.calls})
     n_left = n_called - len(policy["allow_tools"])
