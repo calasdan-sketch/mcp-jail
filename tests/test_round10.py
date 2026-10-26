@@ -339,10 +339,10 @@ class TestAnIdAtTheEndOfAHugeResponse(Base):
 class TestTheMessageLimitHasAnUpperBound(Base):
     def test_the_command_line_refuses_more_than_a_tebibyte(self):
         parser = cli_mod.build_parser()
-        ok = parser.parse_args(["--max-message-bytes", str(2 ** 40), "--",
+        ok = parser.parse_args(["--max-message-bytes", str(2 ** 30), "--",
                                 "x"])
-        self.assertEqual(ok.max_message_bytes, 2 ** 40)
-        for bad in (str(2 ** 40 + 1), "99999999999999999999999", str(2 ** 63)):
+        self.assertEqual(ok.max_message_bytes, 2 ** 30)
+        for bad in (str(2 ** 30 + 1), "99999999999999999999999", str(2 ** 63)):
             err = io.StringIO()
             with redirect_stderr(err), self.assertRaises(SystemExit) as stop:
                 parser.parse_args(["--max-message-bytes", bad, "--", "x"])
@@ -353,19 +353,19 @@ class TestTheMessageLimitHasAnUpperBound(Base):
         err = io.StringIO()
         with redirect_stderr(err):
             code = jail_mod.run(self.policy, [sys.executable, self.server],
-                                max_message=2 ** 40 + 1)
+                                max_message=2 ** 30 + 1)
         self.assertEqual(code, 2)
         self.assertIn("at most", err.getvalue())
 
     def test_the_largest_allowed_limit_works_end_to_end(self):
-        code, replies, err, took = self.drive([request(1, "ping")], 2 ** 40)
+        code, replies, err, took = self.drive([request(1, "ping")], 2 ** 30)
         self.assertEqual(replies[0]["result"], {"ok": True})
         self.assertNotIn("Traceback", err)
 
     def test_from_the_real_command_line(self):
         env = dict(os.environ, PYTHONPATH=REPO, HOME=self.tmp,
                    USERPROFILE=self.tmp)
-        for value, want in ((str(2 ** 40), 0), ("99999999999999999999999", 2)):
+        for value, want in ((str(2 ** 30), 0), ("99999999999999999999999", 2)):
             p = subprocess.run(
                 [sys.executable, "-m", "mcp_jail", "--policy", self.policy,
                  "--max-message-bytes", value, "--", sys.executable,
@@ -432,7 +432,7 @@ class TestLearnHonoursTheLimit(Base):
             self.assertEqual(json.load(f)["allow_tools"], ["echo"])
 
     def test_learn_refuses_a_bad_limit(self):
-        for bad in (10, 2 ** 40 + 1, True, "x"):
+        for bad in (10, 2 ** 30 + 1, True, "x"):
             code, err, out = self.learn(bad, 10)
             self.assertEqual(code, 2, bad)
 

@@ -45,6 +45,7 @@ import time
 import unicodedata
 
 from . import VERSION
+from . import auditchain
 from . import lockfile as lf
 from . import lockguard
 
@@ -81,9 +82,9 @@ DEFAULT_GRACE = 5.0
 DEFAULT_MAX_MESSAGE = 16 * 1024 * 1024
 MIN_MAX_MESSAGE = 1024
 #: --max-message-bytes above this is refused: past what a read call can take
-#: (a larger number died in OverflowError), and 1 TiB is not a limit anyone
-#: needs.
-MAX_MAX_MESSAGE = 2 ** 40
+#: (a larger number died in OverflowError), and 1 GiB is more than any
+#: message needs (it was 1 TiB in earlier versions).
+MAX_MAX_MESSAGE = 2 ** 30
 #: The audit log is rotated to audit.jsonl.1 when it grows past this.
 AUDIT_LOG_MAX_BYTES = 10 * 1024 * 1024
 _TERM_WAIT = 5.0
@@ -112,7 +113,7 @@ def max_message_problem(value) -> "str | None":
                 f"{MIN_MAX_MESSAGE}")
     if value > MAX_MAX_MESSAGE:
         return (f"--max-message-bytes {value!r} must be at most "
-                f"{MAX_MAX_MESSAGE} (1 TiB)")
+                f"{MAX_MAX_MESSAGE} (1 GiB)")
     return None
 
 
@@ -414,13 +415,14 @@ def _compile_rule_set(spec, where: str = "arg_rules",
 # `alow_tools` used to be skipped silently, and a policy that ignores its own
 # allowlist allows every tool.
 POLICY_KEYS = ("allow_tools", "deny_tools", "arg_rules", "policed_methods",
-               "deny_methods", "strict_args", "audit_args", "hide_denied")
+               "deny_methods", "strict_args", "audit_args", "hide_denied",
+               "audit_redact")
 # Notes: written by --init-policy and by `learn`, never read.
 NOTE_KEYS = ("_comment", "_examples", "_not_called")
 RULE_KEYS = ("allow", "deny")  # the keys of one arg_rules.<tool> entry
 # compile_policy() marks the dict it has compiled with these; a policy
 # file must not be able to carry them (a forged marker skips validation).
-_INTERNAL_KEYS = ("_compiled", "_rules_by_norm")
+_INTERNAL_KEYS = ("_compiled", "_rules_by_norm", "_audit_redact")
 
 
 def _check_keys(obj: dict, allowed, where: str) -> None:
@@ -613,6 +615,7 @@ def compile_policy(pol: dict) -> dict:
         raise ValueError("strict_args must be true or false")
     if not isinstance(pol.get("hide_denied", True), bool):
         raise ValueError("hide_denied must be true or false")
+    pol["_audit_redact"] = compile_redactions(pol.get("audit_redact"))
     pol["_compiled"] = True
     return pol
 
@@ -636,9 +639,16 @@ def load_policy(path: str) -> dict:
 
 
 _PERMISSIVE_WARNING = (
-    "mcp-jail: warning: this policy allows every tool and blocks nothing "
-    "(it is still the starter policy). `mcp-jail learn -- <server command>` writes "
-    "a tight allowlist from a real session; see the README.")
+    "mcp-jail: WARNING ================================================\n"
+    "mcp-jail: WARNING: this is still the starter policy: it allows every "
+    "tool and blocks nothing.\n"
+    "mcp-jail: WARNING: the server is NOT restricted yet. First step: run "
+    "`mcp-jail learn -- <server command>` to write a tight allowlist from a "
+    "real session (or `mcp-jail --init-policy --strict`, or a ready-made "
+    "`--pack`), then point --policy at it. See the README.\n"
+    "mcp-jail: WARNING: this notice comes on every start until the policy "
+    "blocks something.\n"
+    "mcp-jail: WARNING ================================================")
 
 
 _STARTER_MARK = "mcp-jail STARTER policy"
@@ -663,7 +673,28 @@ def _blocks_nothing(pol: dict) -> bool:
             and not pol.get("strict_args"))
 
 
-def default_policy() -> dict:
+def default_policy(strict: bool = False) -> dict:
+    """The starter policy. `strict`: one that blocks, not one that allows
+    every tool: no tool is allowed until you list it, argument-less calls
+    only (strict_args), and the resources/* and prompts/* methods are
+    refused."""
+    pol = _permissive_starter()
+    if strict:
+        pol["_comment"] = (
+            "mcp-jail STRICT starter policy: it denies EVERY tool until you "
+            "list the ones you use in allow_tools (run `mcp-jail learn -- "
+            "<server command>` to write that list from a real session), "
+            "accepts only empty arguments from a tool without allow "
+            "patterns (strict_args), and refuses the resources/* and "
+            "prompts/* methods. The notes in _examples are never read. "
+            + "Unknown keys" + pol["_comment"].split("Unknown keys", 1)[1])
+        pol["allow_tools"] = []
+        pol["strict_args"] = True
+        pol["deny_methods"] = ["resources/*", "prompts/*"]
+    return pol
+
+
+def _permissive_starter() -> dict:
     return {
         "_comment": _STARTER_MARK + ": it allows every tool and blocks "
                     "nothing - tighten it before you rely on it (see "
@@ -706,6 +737,69 @@ def default_policy() -> dict:
         "audit_args": "denied",
         "hide_denied": True,
     }
+
+
+# -- audit redaction ----------------------------------------------------------
+
+#: Shapes of well-known credentials, redacted by the entry "@defaults" of
+#: audit_redact.
+DEFAULT_REDACTIONS = (
+    r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}",
+    r"\bgithub_pat_[A-Za-z0-9_]{20,}",
+    r"\bsk-[A-Za-z0-9_\-]{16,}",
+    r"\bxox[abeprs]-[A-Za-z0-9\-]{10,}",
+    r"\bAKIA[0-9A-Z]{16}\b",
+    r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{16,}=*",
+    r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]*",
+)
+MAX_REDACTIONS = 50
+#: how much of a string value is searched for something to redact; the log
+#: keeps AUDIT_VALUE_MAX characters of it, so a secret that is cut by that
+#: cut is still found whole.
+REDACT_SCAN_MAX = 64 * 1024
+REDACTED = "[redacted]"
+
+
+def compile_redactions(spec) -> list:
+    """The compiled audit_redact list of a policy: regexes (strings) whose
+    matches are replaced by [redacted] in every argument value (and key)
+    written to the audit log. The entry "@defaults" stands for common
+    credential shapes. ValueError for anything else."""
+    if spec is None:
+        return []
+    if not isinstance(spec, (list, tuple)):
+        raise ValueError("audit_redact must be a list of regular "
+                         "expressions")
+    if len(spec) > MAX_REDACTIONS:
+        raise ValueError(f"audit_redact may hold {MAX_REDACTIONS} entries "
+                         "at most")
+    out = []
+    for entry in spec:
+        if not isinstance(entry, str) or not entry:
+            raise ValueError("audit_redact must hold regular expressions "
+                             f"(strings), got {entry!r}")
+        for pattern in (DEFAULT_REDACTIONS if entry == "@defaults"
+                        else (entry,)):
+            try:
+                rx = re.compile(pattern)
+            except re.error as e:
+                raise ValueError(f"audit_redact: {entry!r} is not a valid "
+                                 f"regular expression ({e})") from None
+            if rx.match(""):
+                raise ValueError(f"audit_redact: {entry!r} matches the empty "
+                                 "string (it would replace everything)")
+            out.append(rx)
+    return out
+
+
+def redact_text(text: str, redactions) -> str:
+    """`text` with each match of each compiled expression replaced."""
+    if not redactions:
+        return text
+    head, tail = text[:REDACT_SCAN_MAX], text[REDACT_SCAN_MAX:]
+    for rx in redactions:
+        head = rx.sub(REDACTED, head)
+    return head + tail
 
 
 def _leaf_text(v) -> str:
@@ -932,21 +1026,26 @@ def filter_tools_list(pol: dict, result) -> None:
 # ---------------------------------------------------------------------------
 
 
-def audit_args_view(value, depth: int = 0):
+def audit_args_view(value, depth: int = 0, redactions=()):
     """Copy of call arguments fit for the log: every string cut to
     AUDIT_VALUE_MAX chars, nesting cut at the depth the policy denies
-    anyway. Secrets are still secrets - prefer audit_args 'denied'."""
+    anyway. `redactions`: the policy's compiled audit_redact, applied to
+    every string and key before it is cut. Secrets are still secrets -
+    prefer audit_args 'denied'."""
     if depth > MAX_ARG_DEPTH:
         return "...(nested too deep)"
     if isinstance(value, str):
+        n = len(value)
+        value = redact_text(value, redactions)
         if len(value) <= AUDIT_VALUE_MAX:
             return value
-        return value[:AUDIT_VALUE_MAX] + f"...(+{len(value) - AUDIT_VALUE_MAX})"
+        return value[:AUDIT_VALUE_MAX] + f"...(+{n - AUDIT_VALUE_MAX})"
     if isinstance(value, dict):
-        return {str(k)[:AUDIT_VALUE_MAX]: audit_args_view(v, depth + 1)
+        return {str(redact_text(str(k), redactions))[:AUDIT_VALUE_MAX]:
+                audit_args_view(v, depth + 1, redactions)
                 for k, v in value.items()}
     if isinstance(value, list):
-        return [audit_args_view(v, depth + 1) for v in value]
+        return [audit_args_view(v, depth + 1, redactions) for v in value]
     return value
 
 
@@ -1037,6 +1136,22 @@ def _exclusive(lock_path: str):
                 pass
 
 
+_rotation_warned = False
+
+
+def _warn_rotation_skipped(path: str) -> None:
+    """The log is over its limit and could not be locked to rotate it. Say so
+    once per process: a log that silently grows is a disk filling up."""
+    global _rotation_warned
+    if _rotation_warned:
+        return
+    _rotation_warned = True
+    _say(f"mcp-jail: warning: the audit log {path} is over its size limit "
+         "but could not be rotated (another mcp-jail holds its lock). It "
+         "keeps growing until a rotation succeeds; check for a stuck "
+         "process, or lower MCP_JAIL_AUDIT_MAX_MB.")
+
+
 def _rotate_audit_log(path: str) -> None:
     """Keep the log from growing for ever: past the limit the file becomes
     `<log>.1` (replacing the one before it) and a new log starts. So the
@@ -1062,6 +1177,7 @@ def _rotate_audit_log(path: str) -> None:
         return
     with _rotate_lock, _exclusive(path + ".lock") as got:
         if not got:
+            _warn_rotation_skipped(path)
             return
         try:
             if os.path.getsize(path) <= limit:
@@ -1069,6 +1185,21 @@ def _rotate_audit_log(path: str) -> None:
             os.replace(path, path + ".1")
         except OSError:
             pass
+
+
+_CHAIN = {"on": False}
+
+
+def set_audit_chain(on: bool) -> None:
+    """Turn the hash chain over the audit log on or off (--audit-chain); the
+    environment variable MCP_JAIL_AUDIT_CHAIN=1 turns it on too."""
+    _CHAIN["on"] = bool(on)
+
+
+def audit_chain_enabled() -> bool:
+    return _CHAIN["on"] or os.environ.get(
+        "MCP_JAIL_AUDIT_CHAIN", "").strip().lower() in ("1", "true", "yes",
+                                                        "on")
 
 
 def audit(event: dict) -> None:
@@ -1080,6 +1211,14 @@ def audit(event: dict) -> None:
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         _rotate_audit_log(path)
+        if audit_chain_enabled():
+            with _rotate_lock, _exclusive(path + ".lock") as got:
+                event["prev"] = auditchain.head(path)
+                if not got:
+                    event["chain_unlocked"] = True
+                with _open_private_append(path) as f:
+                    f.write(json.dumps(event) + "\n")
+            return
         with _open_private_append(path) as f:
             f.write(json.dumps(event) + "\n")
     except OSError as e:
@@ -1125,9 +1264,9 @@ def _preview(line: bytes, limit: int = 200) -> str:
     return repr(text[:limit] + ("..." if len(text) > limit else ""))
 
 
-def _clip(value, limit: int = AUDIT_VALUE_MAX) -> str:
+def _clip(value, limit: int = AUDIT_VALUE_MAX, redactions=()) -> str:
     """A message (the wire line, or the parsed object) cut down for the
-    audit record."""
+    audit record (with the policy's audit_redact applied first)."""
     if isinstance(value, bytes):
         text = value.decode("utf-8", "replace").strip()
     else:
@@ -1135,6 +1274,7 @@ def _clip(value, limit: int = AUDIT_VALUE_MAX) -> str:
             text = json.dumps(value)
         except (ValueError, RecursionError):
             text = f"<{type(value).__name__}>"
+    text = redact_text(text, redactions)
     if len(text) <= limit:
         return text
     return text[:limit] + f"...(+{len(text) - limit})"
@@ -1523,7 +1663,53 @@ def _server_problem(e: ServerNotFound) -> str:
     return f"server command not found or not executable: {e}"
 
 
-def _spawn(server_cmd: list[str]):
+#: Variables a server needs to start at all, kept by --env-allow whether or
+#: not they are named (a trailing * is a prefix). Nothing here is a
+#: credential by itself; everything else has to be named.
+ENV_BASELINE = ("PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR",
+                "COMSPEC", "TEMP", "TMP", "TMPDIR", "HOME", "USERPROFILE",
+                "HOMEDRIVE", "HOMEPATH", "APPDATA", "LOCALAPPDATA",
+                "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)", "LANG",
+                "LC_*", "TZ", "USER", "USERNAME", "LOGNAME", "SHELL",
+                "TERM", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME",
+                "XDG_CONFIG_HOME", "XDG_DATA_HOME")
+
+
+def env_allow_problem(names) -> "str | None":
+    """Why `names` cannot be --env-allow (None: they can)."""
+    for name in names or ():
+        if not isinstance(name, str) or not name.strip():
+            return "--env-allow needs variable names"
+        if "=" in name or "\x00" in name:
+            return f"--env-allow {name!r}: a name has no '=' in it"
+        if name.strip().strip("*") == "":
+            return ("--env-allow *: that passes every variable, which is "
+                    "what leaving the option out does")
+        if "*" in name.strip()[:-1]:
+            return (f"--env-allow {name!r}: '*' is only allowed at the end "
+                    "(a prefix)")
+    return None
+
+
+def child_env(allow, environ=None) -> dict:
+    """The environment the server is started with under --env-allow: the
+    ENV_BASELINE variables and those matching `allow` (a name, or a prefix
+    with a trailing *), nothing else. Names are compared case-insensitively
+    on Windows only, as the system does."""
+    environ = os.environ if environ is None else environ
+    fold = (lambda t: t.upper()) if _WINDOWS else (lambda t: t)
+    exact, prefixes = set(), []
+    for name in tuple(ENV_BASELINE) + tuple(n.strip() for n in allow):
+        if name.endswith("*"):
+            prefixes.append(fold(name[:-1]))
+        else:
+            exact.add(fold(name))
+    return {k: v for k, v in environ.items()
+            if fold(k) in exact or any(fold(k).startswith(p)
+                                       for p in prefixes)}
+
+
+def _spawn(server_cmd: list[str], env_allow=None):
     # Resolve the executable ourselves: a clean error instead of a
     # FileNotFoundError traceback, and on Windows `npx` is `npx.cmd`,
     # which only PATHEXT-aware lookup (shutil.which) finds.
@@ -1540,7 +1726,8 @@ def _spawn(server_cmd: list[str]):
     try:
         proc = subprocess.Popen(
             [exe] + list(server_cmd[1:]), stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE, stderr=err)
+            stdout=subprocess.PIPE, stderr=err,
+            env=None if env_allow is None else child_env(env_allow))
     except OSError as e:    # no #! line (Exec format error), permission, ...
         raise ServerNotFound(server_cmd[0], e.strerror or str(e)) from None
     assert proc.stdin and proc.stdout
@@ -2013,7 +2200,7 @@ class _Proxy:
             event["method"] = method
         mode = self.pol.get("audit_args", "denied")
         if mode == "all" or (mode == "denied" and not ok):
-            event["args"] = audit_args_view(args)
+            event["args"] = audit_args_view(args, 0, self.pol.get("_audit_redact") or ())
         audit(event)
 
     # -- client -> server ---------------------------------------------------
@@ -2027,7 +2214,7 @@ class _Proxy:
             event["method"] = method
         mode = (self.pol or {}).get("audit_args", "denied")
         if subject is not None and mode != "none":
-            event["message"] = _clip(subject)
+            event["message"] = _clip(subject, redactions=(self.pol or {}).get("_audit_redact") or ())
         audit(event)
 
     def _refuse(self, why: str, code: int = INVALID_REQUEST, req_id=None,
@@ -2644,7 +2831,7 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
         max_message: int = DEFAULT_MAX_MESSAGE, lockfile: "str | None" = None,
         lock_server: "str | None" = None, on_drift: str = "block",
         shadow: bool = False, shadow_report: "str | None" = None,
-        ask=None) -> int:
+        ask=None, env_allow=None, audit_chain: "bool | None" = None) -> int:
     """Run the jail: policy-check stdin -> server, pass server -> stdout.
 
     `stdin`/`stdout` default to the process's own (binary) streams; tests
@@ -2657,13 +2844,22 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
     evaluate the policy and the lockfile but enforce nothing, and say at the
     end what would have been refused (also written to `shadow_report` as
     JSON). `ask` answers on_drift="ask" questions (default: the terminal).
+
+    `env_allow`: start the server with only the baseline variables and the
+    names listed here (a trailing * is a prefix); None passes the whole
+    environment. `audit_chain`: chain the audit records (see auditchain);
+    None leaves it as MCP_JAIL_AUDIT_CHAIN says.
     """
     problem = _refuse_seconds(timeout=timeout, grace=grace)
     if problem is None:
         problem = max_message_problem(max_message)
+    if problem is None:
+        problem = env_allow_problem(env_allow)
     if problem:
         _say(f"mcp-jail: {problem}")
         return 2
+    if audit_chain is not None:
+        set_audit_chain(audit_chain)
     policy_path = expand_path(policy_path)
     try:
         pol = load_policy(policy_path)
@@ -2703,7 +2899,7 @@ def run(policy_path: str, server_cmd: list[str], timeout: float = 30.0,
                "passed on. A summary follows when the session ends.")
     with _StopSignals() as stop:
         try:
-            proc = _spawn(server_cmd)
+            proc = _spawn(server_cmd, env_allow)
         except ServerNotFound as e:
             _say(f"mcp-jail: {_server_problem(e)}")
             return 2
@@ -3135,7 +3331,7 @@ def learn(server_cmd: list[str], script: str | None = None,
           out: str | None = None, timeout: float = 30.0,
           stdin=None, stdout=None, grace: float = DEFAULT_GRACE,
           max_message: int = DEFAULT_MAX_MESSAGE,
-          record: "str | None" = None) -> int:
+          record: "str | None" = None, env_allow=None) -> int:
     """Observe a server and emit a tight-fit allowlist policy.
 
     --script mode drives canned calls against the server (no client).
@@ -3151,6 +3347,8 @@ def learn(server_cmd: list[str], script: str | None = None,
     problem = _refuse_seconds(timeout=timeout, grace=grace)
     if problem is None:
         problem = max_message_problem(max_message)
+    if problem is None:
+        problem = env_allow_problem(env_allow)
     if problem:
         _say(f"mcp-jail learn: {problem}")
         return 2
@@ -3204,7 +3402,7 @@ def learn(server_cmd: list[str], script: str | None = None,
     # policy; a script is driven by this thread alone and has no loop to tell
     with (_StopSignals() if script is None else contextlib.nullcontext()) as stop:
         try:
-            proc = _spawn(server_cmd)
+            proc = _spawn(server_cmd, env_allow)
         except ServerNotFound as e:
             _say(f"mcp-jail learn: {_server_problem(e)}")
             return 2

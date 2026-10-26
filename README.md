@@ -7,6 +7,8 @@ server, checks every `tools/call` against a JSON policy, and forwards or
 denies. Denied calls get a JSON-RPC error plus an append-only audit-log
 line — never execution.
 
+**Limits:** It filters what flows through a stdio proxy by policy; it cannot see what a server does on its own, and an audit log written by the same user can be edited by that user.
+
 **Scope, plainly:** the tool policy is applied to `tools/call` (and to
 any other method you list in `policed_methods`, such as `prompts/get`
 or `resources/read`). Whole JSON-RPC methods can be refused with
@@ -77,6 +79,18 @@ begin: run `mcp-jail learn -- <server command>` to write a tight allowlist from
 a real session, or edit the file; its `_examples` entry (a note, never read)
 holds stricter policies to copy from - only the tools you use, named tools
 blocked, a path limit on `read_file`, a refused method family.
+
+`--init-policy --strict` writes a starter that **blocks**: `allow_tools` is
+empty (no tool is allowed until you list the ones you use), `strict_args` is
+on, and `deny_methods` refuses `resources/*` and `prompts/*`. `--init-policy
+--pack filesystem|git|shell` writes a ready-made read-only starter for that
+kind of server, using the tool names of the reference servers: `filesystem`
+lists and reads files (not `..`, `~/.ssh`, `~/.aws`, key files or `.env`) and
+cannot write; `git` allows status, diff, log, show and branch listing but not
+add, commit, reset, checkout or init; `shell` allows only a short list of
+read-only commands and refuses `; & | ` $ < >` and line breaks. Check a
+pack's tool names against your server's `tools/list` (a tool it does not know
+is denied) and tighten it with `mcp-jail learn`.
 
 Policy (`policy.json`):
 
@@ -190,7 +204,34 @@ a lock (`audit.jsonl.lock`, next to the log), so only one of them rotates and
 the history is never replaced by a nearly empty file. If the lock cannot be
 had within two seconds the log is not rotated that time.
 
-`--max-message-bytes N` (default 16777216, 16 MiB; from 1024 to 2^40): the
+**Audit records can be redacted.** `audit_redact` in the policy is a list of
+regular expressions; every match in a logged argument value or key (and in the
+text of a rejected message) is replaced by `[redacted]` before the record is
+cut to 200 characters. The entry `"@defaults"` stands for common credential
+shapes (GitHub and Slack tokens, `sk-` keys, AWS key ids, `Bearer` values,
+JSON Web Tokens). It narrows what the log keeps; it does not make logging
+argument values safe, so `audit_args: "denied"` stays the default.
+
+**Hash chain (optional).** `--audit-chain` (or `MCP_JAIL_AUDIT_CHAIN=1`) adds a
+`prev` field to each record: the SHA-256 of the line before it. `mcp-jail
+--verify-audit` walks `audit.jsonl.1` and `audit.jsonl` and reports the record
+where the chain breaks (one was changed, removed from the middle, or
+inserted). **The limit:** the log is a file the user that runs mcp-jail can
+write, so anyone with that user's rights can rewrite the records and recompute
+every hash after them, or cut records off the end and leave a chain that is
+still valid. It catches accident and careless tampering. For more, copy the
+`head` hash that `--verify-audit` prints to a place that user cannot write (a
+ticket, a remote log) and compare later. When the log is over its limit and the
+rotation lock cannot be had, mcp-jail now says so on stderr (once per process).
+
+**The server's environment.** By default the server is started with your whole
+environment, which usually holds tokens meant for other things.
+`--env-allow NAME` (repeatable, or comma-separated; a trailing `*` is a prefix,
+as in `MYAPP_*`) starts it with only the basic variables a program needs to run
+(`PATH`, `HOME`, `USERPROFILE`, `TEMP`, `SYSTEMROOT`, `LANG`, `LC_*` ...) and
+the names you list. `learn` takes it too.
+
+`--max-message-bytes N` (default 16777216, 16 MiB; from 1024 to 2^30, 1 GiB; it was 1 TiB in earlier versions): the
 longest message - one line, newline included - the jail reads from the client
 or from the server. A longer client message is refused with `-32600` (under
 its id when the first or the last bytes show one) and a longer server response

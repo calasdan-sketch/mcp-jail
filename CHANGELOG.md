@@ -2,12 +2,16 @@
 
 ## 0.7.0
 
+- The starter policy's warning is loud and comes on every start while the policy blocks nothing; it names `mcp-jail learn` as the first step. `--init-policy --strict` writes a starter that blocks (no tool allowed until listed, `strict_args`, `resources/*` and `prompts/*` refused).
+- `--init-policy --pack filesystem|git|shell`: bundled read-only starter policies for the reference servers.
+- Optional audit-log hash chain: `--audit-chain` (or `MCP_JAIL_AUDIT_CHAIN=1`) and `--verify-audit`. It catches a record changed, removed from the middle or inserted; the same user can rewrite the whole chain, which the README says.
+- `audit_redact` (policy): a list of regular expressions, and `"@defaults"` for common credential shapes, replaced by `[redacted]` in logged argument values and keys.
+- `--env-allow NAME` (also on `learn`) starts the server with only the basic variables and those named, not the whole environment.
+- A log that is over its limit but cannot be rotated (the lock is held) now says so on stderr, once per process.
+- **Changed:** `--max-message-bytes` is capped at 1 GiB (it was 1 TiB).
+- CI installs the built wheel on Windows (`Scripts\mcp-jail`) and macOS and runs it. (`--on-drift block` was already the default drift mode; unchanged.)
 - `.gitattributes` keeps docs/LOCKFILE.md and the shared vectors on LF in every checkout; the spec-hash test hashes the LF text, so a CRLF checkout (Windows) still matches the hash the vectors name.
-
 - Wire messages nested deeper than 400 levels are a parse error by a depth limit of our own instead of relying on RecursionError (Python 3.14 does not raise it with a large stack).
-
-- Tests only: the linear-time reader test repeats a noisy timing attempt (three tries) so a busy CI runner cannot fail it; a quadratic reader still fails all three.
-
 - **New: `--lockfile mcp.lock`.** Compares every `tools/list` answer with the
   lockfile `mcp-audit lock` writes (format in `docs/LOCKFILE.md`, shared with
   mcp-audit and covered by the same test vectors). `--on-drift` says what
@@ -23,6 +27,7 @@
   `mcp-jail learn --record FILE` writes such a session.
 - `--audit` shows lockfile findings and `SHADOW` records.
 - Waiting for an `--on-drift ask` answer no longer counts against `--timeout`.
+- Tests only: the linear-time reader test repeats a noisy timing attempt (three tries) so a busy CI runner cannot fail it; a quadratic reader still fails all three.
 
 ## 0.6.4
 

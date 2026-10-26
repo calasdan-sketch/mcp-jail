@@ -14,6 +14,7 @@ finds the problems; mcp-jail enforces least-privilege at runtime.
 from __future__ import annotations
 
 import argparse
+import copy
 import errno
 import json
 from . import _depth as depth_mod
@@ -21,7 +22,9 @@ import os
 import sys
 
 from . import VERSION
+from . import auditchain
 from . import jail as jail_mod
+from . import packs
 
 
 # Tests patch this to exercise the Windows branch on any OS.
@@ -120,7 +123,7 @@ def _positive_count(text: str) -> int:
 
 
 def _message_bytes(text: str) -> int:
-    """argparse type for --max-message-bytes: a whole number, 1024 to 2**40."""
+    """argparse type for --max-message-bytes: a whole number, 1024 to 2**30 (1 GiB)."""
     try:
         value = int(text)
     except ValueError:
@@ -131,32 +134,81 @@ def _message_bytes(text: str) -> int:
         if value > jail_mod.MAX_MAX_MESSAGE:
             raise argparse.ArgumentTypeError(
                 f"{text!r} is above the maximum of {jail_mod.MAX_MAX_MESSAGE} "
-                f"(1 TiB)")
+                f"(1 GiB)")
         raise argparse.ArgumentTypeError(
             f"{text!r} is below the minimum of {jail_mod.MIN_MAX_MESSAGE}")
     return value
 
 
+def _env_names(values) -> list:
+    """The names of --env-allow (repeatable, comma-separated)."""
+    return [n.strip() for v in values or () for n in v.split(",")
+            if n.strip()]
+
+
 def cmd_init_policy(args) -> int:
+    if args.pack and args.strict:
+        jail_mod._say("error: --pack and --strict are two different "
+                      "starters; give one")
+        return 2
     try:
         path = jail_mod.expand_path(args.path)
         if os.path.exists(path) and not args.force:
             jail_mod._say(f"exists: {path} (use --force to overwrite)")
             return 2
+        policy = (packs.policy(args.pack) if args.pack
+                  else jail_mod.default_policy(strict=args.strict))
+        jail_mod.compile_policy(copy.deepcopy(policy))     # never write a bad one
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(jail_mod.default_policy(), f, indent=2)
+            json.dump(policy, f, indent=2)
             f.write("\n")
     except (OSError, ValueError) as e:     # unwritable, a directory, a NUL ...
         why = getattr(e, "strerror", None) or str(e)
         jail_mod._say(f"mcp-jail: cannot write the policy {args.path}: {why}")
         return 2
     print(f"wrote {path}")
-    jail_mod._say("mcp-jail: warning: this starter policy allows EVERY tool "
-                  "and blocks nothing. Run `mcp-jail learn -- <server "
-                  "command>` to write a tight one from a real session, or "
-                  "edit it (see _examples in the file).")
+    if args.pack:
+        jail_mod._say(f"mcp-jail: wrote the {args.pack} pack: a read-only "
+                      "starting point. Check its tool names against your "
+                      "server's tools/list, then tighten it with `mcp-jail "
+                      "learn -- <server command>`.")
+    elif args.strict:
+        jail_mod._say("mcp-jail: wrote the STRICT starter: it denies every "
+                      "tool until you list them. Run `mcp-jail learn -- "
+                      "<server command>` to write the list from a real "
+                      "session.")
+    else:
+        jail_mod._say("mcp-jail: warning: this starter policy allows EVERY "
+                      "tool and blocks nothing. First step: run `mcp-jail "
+                      "learn -- <server command>` to write a tight one from "
+                      "a real session, or write a blocking starter with "
+                      "`--init-policy --strict` or `--pack`.")
     return 0
+
+
+def cmd_verify_audit(args) -> int:
+    path = jail_mod.audit_log_path()
+    if not os.path.exists(path) and not os.path.exists(path + ".1"):
+        print("no audit log yet.")
+        return 0
+    res = auditchain.verify(path)
+    if res["chained"] == 0:
+        print(f"{res['records']} record(s), none chained: the log was "
+              "written without --audit-chain, so there is nothing to check.")
+        return 1
+    if res["ok"]:
+        print(f"chain ok: {res['records']} record(s), head {res['head']}")
+        print("Keep the head somewhere the user that runs mcp-jail cannot "
+              "write; a later check can then show the log was not cut back "
+              "or rewritten. (Without that, the same user can rewrite the "
+              "whole chain: see the README.)")
+        return 0
+    for problem in res["problems"]:
+        print(f"BROKEN: {problem}")
+    print(f"chain broken: {len(res['problems'])} problem(s) in "
+          f"{res['records']} record(s)")
+    return 1
 
 
 def _plain(value) -> str:
@@ -235,11 +287,15 @@ def cmd_learn(argv: list[str]) -> int:
                    default=jail_mod.DEFAULT_MAX_MESSAGE, metavar="N",
                    help="the longest message, one line, accepted from the "
                         "client or the server (default: 16777216, 16 MiB; "
-                        "1024 to 1099511627776). A longer server message "
+                        "1024 to 1073741824). A longer server message "
                         "is skipped")
     p.add_argument("--record", metavar="FILE",
                    help="also write the calls seen as a session file for "
                         "`mcp-jail verify-policy`")
+    p.add_argument("--env-allow", action="append", default=[], metavar="NAME",
+                   help="start the server with only the basic variables "
+                        "(PATH, HOME, TEMP ...) and NAME (repeatable, "
+                        "comma-separated; a trailing * is a prefix)")
     p.add_argument("server", nargs=argparse.REMAINDER,
                    help="server command after -- : "
                         "mcp-jail learn --script c.json -- <cmd>")
@@ -255,7 +311,8 @@ def cmd_learn(argv: list[str]) -> int:
     return jail_mod.learn(cmd, script=args.script, out=args.out,
                           timeout=args.timeout, grace=args.grace,
                           max_message=args.max_message_bytes,
-                          record=args.record)
+                          record=args.record,
+                          env_allow=_env_names(args.env_allow) or None)
 
 
 def cmd_verify_policy(argv: list[str]) -> int:
@@ -297,6 +354,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--init-policy", action="store_true",
                    help="write an annotated starter policy to --path and "
                         "exit (allows every tool: edit it)")
+    p.add_argument("--strict", action="store_true",
+                   help="with --init-policy: write a starter that BLOCKS: no "
+                        "tool is allowed until you list it, and the "
+                        "resources/* and prompts/* methods are refused")
+    p.add_argument("--pack", choices=packs.names(), metavar="NAME",
+                   help="with --init-policy: write a ready-made read-only "
+                        "starter for a kind of server (" + ", ".join(
+                            packs.names()) + ")")
     p.add_argument("--path", default=default_policy, metavar="FILE",
                    help=f"where --init-policy writes "
                         f"(default: {default_policy})")
@@ -308,6 +373,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=_positive_count, default=50, metavar="N",
                    help="how many audit entries --audit shows: the last N, "
                         "a whole number, 1 or more (default: 50)")
+    p.add_argument("--audit-chain", action="store_true",
+                   help="chain the audit records: each carries the SHA-256 "
+                        "of the line before it, so a changed, removed or "
+                        "inserted record is found by --verify-audit. The "
+                        "same user can rewrite the whole chain: see the "
+                        "README")
+    p.add_argument("--verify-audit", action="store_true",
+                   help="check the chain of the audit log and exit (0 intact, "
+                        "1 broken or no chain)")
+    p.add_argument("--env-allow", action="append", default=[], metavar="NAME",
+                   help="start the server with only the basic variables "
+                        "(PATH, HOME, TEMP ...) and NAME (repeatable, "
+                        "comma-separated; a trailing * is a prefix) instead "
+                        "of your whole environment")
     p.add_argument("--timeout", type=_seconds, default=30.0, metavar="SECS",
                    help="seconds to wait for each server response, and for "
                         "the server to take each message off its stdin "
@@ -323,7 +402,7 @@ def build_parser() -> argparse.ArgumentParser:
                    default=jail_mod.DEFAULT_MAX_MESSAGE, metavar="N",
                    help="the longest message, one line, accepted from the "
                         "client or the server (default: 16777216, 16 MiB; "
-                        "1024 to 1099511627776). A longer client message is "
+                        "1024 to 1073741824). A longer client message is "
                         "refused "
                         "with -32600, a longer server response with -32603 "
                         "and an audit record; neither is held in memory")
@@ -365,6 +444,11 @@ def _main(argv: list[str]) -> int:
         return cmd_init_policy(args)
     if args.audit:
         return cmd_audit(args)
+    if args.verify_audit:
+        return cmd_verify_audit(args)
+    if (args.strict or args.pack) and not args.init_policy:
+        jail_mod._say("error: --strict and --pack go with --init-policy")
+        return 2
     cmd = list(args.server)
     if cmd and cmd[0] == "--":
         cmd = cmd[1:]
@@ -379,7 +463,9 @@ def _main(argv: list[str]) -> int:
                         grace=args.grace, max_message=args.max_message_bytes,
                         lockfile=args.lockfile, lock_server=args.lock_server,
                         on_drift=args.on_drift, shadow=args.shadow,
-                        shadow_report=args.shadow_report)
+                        shadow_report=args.shadow_report,
+                        env_allow=_env_names(args.env_allow) or None,
+                        audit_chain=True if args.audit_chain else None)
 
 
 def main(argv=None) -> int:

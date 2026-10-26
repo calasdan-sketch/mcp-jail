@@ -37,3 +37,29 @@ jobs:
           python -m venv "$RUNNER_TEMP/v"
           "$RUNNER_TEMP/v/bin/pip" install dist/*.whl
           "$RUNNER_TEMP/v/bin/mcp-jail" --version
+  wheel-smoke:
+    # The wheel, installed into a clean virtual environment, on the systems
+    # people run it on: the console script exists where pip puts it
+    # (Scripts\ on Windows, bin/ elsewhere) and a real session passes through.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: python -m pip install build
+      - run: python -m build --wheel
+      - name: install the wheel and run the console script
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/v"
+          if [ -d "$RUNNER_TEMP/v/Scripts" ]; then bindir=Scripts; else bindir=bin; fi
+          "$RUNNER_TEMP/v/$bindir/python" -m pip install dist/*.whl
+          "$RUNNER_TEMP/v/$bindir/mcp-jail" --version
+          "$RUNNER_TEMP/v/$bindir/mcp-jail" --init-policy --strict --path "$RUNNER_TEMP/p.json"
+          "$RUNNER_TEMP/v/$bindir/mcp-jail" --init-policy --pack git --path "$RUNNER_TEMP/g.json"
+          "$RUNNER_TEMP/v/$bindir/mcp-jail" --audit

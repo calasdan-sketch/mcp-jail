@@ -38,3 +38,6 @@ mcp-jail = "mcp_jail.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["mcp_jail*"]
+
+[tool.setuptools.package-data]
+mcp_jail = ["py.typed"]

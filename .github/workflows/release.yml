@@ -3,6 +3,22 @@ on:
   push: {tags: ["v*"]}
 permissions: {contents: read}
 jobs:
+  test:
+    name: test (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        python: ["3.10", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Run the tests
+        run: |
+          python -m unittest discover -s tests
   build:
     runs-on: ubuntu-latest
     steps:
@@ -39,7 +55,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with: {name: dist, path: dist/}
   publish:
-    needs: build
+    needs: [test, build]
     runs-on: ubuntu-latest
     environment: pypi
     permissions: {id-token: write}
