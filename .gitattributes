@@ -1,0 +1,3 @@
+# the lockfile spec is hashed byte for byte (tests/vectors/lockfile_v1.json): keep LF on Windows
+docs/LOCKFILE.md text eol=lf
+tests/vectors/lockfile_v1.json text eol=lf

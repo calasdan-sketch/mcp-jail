@@ -753,7 +753,8 @@ for raw in sys.stdin:
 
     def test_the_spec_is_the_one_the_vectors_name(self):
         with open(os.path.join(REPO, "docs", "LOCKFILE.md"), "rb") as f:
-            digest = hashlib.sha256(f.read()).hexdigest()
+            # the hash is over the LF text; a Windows checkout may turn it into CRLF
+            digest = hashlib.sha256(f.read().replace(b"\r\n", b"\n")).hexdigest()
         self.assertEqual(digest, self.vectors()["spec_sha256"])
 
 
