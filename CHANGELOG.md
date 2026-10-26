@@ -2,6 +2,8 @@
 
 ## 0.7.0
 
+- Tests only: the linear-time reader test repeats a noisy timing attempt (three tries) so a busy CI runner cannot fail it; a quadratic reader still fails all three.
+
 - **New: `--lockfile mcp.lock`.** Compares every `tools/list` answer with the
   lockfile `mcp-audit lock` writes (format in `docs/LOCKFILE.md`, shared with
   mcp-audit and covered by the same test vectors). `--on-drift` says what

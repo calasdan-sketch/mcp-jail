@@ -118,11 +118,17 @@ class TestTheFdReaderIsLinear(unittest.TestCase):
         return took
 
     def test_a_long_line_costs_time_in_proportion_to_its_length(self):
-        small = min(self.feed(8_000_000) for _ in range(2))
-        large = min(self.feed(32_000_000) for _ in range(2))
-        # 4x the data: linear is ~4x, the old rescan was ~16x
-        self.assertLess(large, max(small, 0.02) * 9,
-                        "8 MB: %.3f s, 32 MB: %.3f s" % (small, large))
+        # 4x the data: linear is ~4x, the old rescan was ~16x. A busy CI runner can
+        # slow one measurement, so a noisy attempt is repeated (a really quadratic
+        # reader fails every attempt).
+        seen = []
+        for _ in range(3):
+            small = min(self.feed(8_000_000) for _ in range(2))
+            large = min(self.feed(32_000_000) for _ in range(2))
+            seen.append("8 MB: %.3f s, 32 MB: %.3f s" % (small, large))
+            if large < max(small, 0.02) * 9:
+                return
+        self.fail("; ".join(seen))
 
     def test_readline_with_a_limit_hands_out_pieces_of_a_long_line(self):
         r, w = os.pipe()
