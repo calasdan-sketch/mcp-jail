@@ -29,6 +29,7 @@ import importlib
 import io
 import itertools
 import json
+from . import _depth as depth_mod
 import math
 import os
 import queue
@@ -1111,7 +1112,7 @@ def _lenient_id(line: bytes):
     can be failed closed by id rather than by guesswork. _NO_ID when there
     is none."""
     try:
-        obj = json.loads(line.decode("utf-8"), parse_int=_int_or_none)
+        obj = depth_mod.loads(line.decode("utf-8"), parse_int=_int_or_none)
     except (ValueError, RecursionError):
         return _NO_ID
     if isinstance(obj, dict) and "id" in obj:
@@ -1144,7 +1145,7 @@ def _salvage_id(line: bytes):
     trust: it parses, has exactly one "id" key and that holds a string or
     an integer. Otherwise _NO_ID (the refusal then carries a null id)."""
     try:
-        obj = json.loads(line.decode("utf-8"),
+        obj = depth_mod.loads(line.decode("utf-8"),
                          object_pairs_hook=_no_duplicate_keys,
                          parse_int=_int_or_none)
     except (ValueError, RecursionError):
@@ -1427,7 +1428,7 @@ def _head_id(head: bytes):
     if not m:
         return _NO_ID
     try:
-        rid = json.loads(m.group(1))
+        rid = depth_mod.loads(m.group(1))
     except ValueError:
         return _NO_ID
     return rid if isinstance(rid, (str, int)) and not isinstance(rid, bool) \
@@ -1449,7 +1450,7 @@ def _tail_id(tail: bytes):
     if not m:
         return _NO_ID
     try:
-        rid = json.loads(m.group(1))
+        rid = depth_mod.loads(m.group(1))
     except ValueError:
         return _NO_ID
     return rid if isinstance(rid, (str, int)) and not isinstance(rid, bool) \
@@ -1664,7 +1665,7 @@ def _parse(line: bytes):
     if not body.strip(" "):
         return None, None, ""  # blank line: protocol noise
     try:
-        obj = json.loads(body, object_pairs_hook=_no_duplicate_keys,
+        obj = depth_mod.loads(body, object_pairs_hook=_no_duplicate_keys,
                          parse_constant=_no_constants,
                          parse_float=_finite_float, parse_int=_bounded_int)
     except (_DuplicateKey, _Unrepresentable) as e:

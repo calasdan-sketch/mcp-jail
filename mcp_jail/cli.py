@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import errno
 import json
+from . import _depth as depth_mod
 import os
 import sys
 
@@ -186,7 +187,7 @@ def cmd_audit(args) -> int:
         lines = f.readlines()[-args.limit:]
     for ln in lines:
         try:
-            e = json.loads(ln)
+            e = depth_mod.loads(ln)
         except (ValueError, RecursionError):
             continue
         if not isinstance(e, dict):

@@ -2,6 +2,8 @@
 
 ## 0.7.0
 
+- Wire messages nested deeper than 400 levels are a parse error by a depth limit of our own instead of relying on RecursionError (Python 3.14 does not raise it with a large stack).
+
 - Tests only: the linear-time reader test repeats a noisy timing attempt (three tries) so a busy CI runner cannot fail it; a quadratic reader still fails all three.
 
 - **New: `--lockfile mcp.lock`.** Compares every `tools/list` answer with the
